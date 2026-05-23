@@ -1,0 +1,15 @@
+{
+  "name": "codex-telegram-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Security-first Telegram bridge for running Codex CLI against allowlisted workspaces.",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node test/run.js",
+    "doctor": "node src/doctor.js",
+    "setup-telegram": "node src/setup-telegram-commands.js"
+  },
+  "engines": {
+    "node": ">=12"
+  }
+}
