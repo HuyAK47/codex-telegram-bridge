@@ -407,6 +407,71 @@ class SessionManager {
     await this.runAndNotify(chatId, 'Test', buildTestCommand(session.workspace, testCommand));
   }
 
+  async apk(chatId) {
+    const session = this.requireWorkspace(chatId);
+    const fs = require('fs');
+    const path = require('path');
+    const { exec } = require('child_process');
+
+    const pubspecPath = path.join(session.workspace, 'pubspec.yaml');
+    if (!fs.existsSync(pubspecPath)) {
+      throw new Error('Workspace hiện tại không phải là dự án Flutter (thiếu pubspec.yaml)');
+    }
+
+    this.notifier(chatId, '▶️ Bắt đầu build APK (split-per-abi)...');
+    const spec = {
+      command: '/bin/bash',
+      args: ['-lc', 'flutter build apk --split-per-abi'],
+      cwd: session.workspace
+    };
+
+    const result = await runWorkspaceCommand(spec, 300000);
+    if (result.code !== 0) {
+      this.notifier(chatId, `❌ Build APK thất bại (exit ${result.code}):\n${result.output}`);
+      return;
+    }
+
+    this.notifier(chatId, '✅ Build APK thành công. Đang quét và gửi file APK...');
+    const apkDir = path.join(session.workspace, 'build/app/outputs/flutter-apk');
+    if (!fs.existsSync(apkDir)) {
+      this.notifier(chatId, '❌ Không tìm thấy thư mục build APK.');
+      return;
+    }
+
+    const files = fs.readdirSync(apkDir);
+    const apkFiles = files.filter(f => f.endsWith('.apk') && !f.includes('lip-') && f !== 'app.apk');
+    if (apkFiles.length === 0) {
+      this.notifier(chatId, '❌ Không tìm thấy file APK nào.');
+      return;
+    }
+
+    const token = this.config.telegramBotToken;
+    for (const file of apkFiles) {
+      const filePath = path.join(apkDir, file);
+      this.notifier(chatId, `📤 Đang gửi file: ${file}...`);
+      await new Promise((resolve) => {
+        const cmd = `curl -s -F chat_id="${chatId}" -F caption="Flutter APK: ${file}" -F document=@"${filePath}" https://api.telegram.org/bot${token}/sendDocument`;
+        exec(cmd, (error, stdout) => {
+          if (error) {
+            this.notifier(chatId, `❌ Gửi file ${file} thất bại: ${error.message}`);
+          } else {
+            try {
+              const res = JSON.parse(stdout);
+              if (!res.ok) {
+                this.notifier(chatId, `❌ Gửi file ${file} thất bại từ Telegram API: ${res.description}`);
+              } else {
+                this.notifier(chatId, `✅ Đã gửi xong: ${file}`);
+              }
+            } catch (e) {
+              this.notifier(chatId, `❌ Gửi file ${file} thất bại (lỗi parse phản hồi): ${stdout}`);
+            }
+          }
+          resolve();
+        });
+      });
+    }
+  }
+
   async runProfileCommand(chatId, name) {
     const session = this.requireWorkspace(chatId);
     const profile = getRepoProfile(this.config, session.repoAlias || '');

@@ -119,3 +119,18 @@ Khi bạn lập trình ứng dụng Flutter từ xa qua Telegram:
    - Ứng dụng sẽ tự động khởi động và hiển thị trên màn hình stream của trình duyệt web.
 4. **Xem kết quả:** Bạn có thể kiểm tra trực tiếp giao diện và kiểm thử tính năng ngay tại chỗ mà không cần tiếp xúc trực tiếp với máy host.
 
+---
+
+## 📦 Tự động Build và Tải file APK trực tiếp từ Bot Telegram
+
+Nếu bạn muốn cài đặt app trực tiếp lên điện thoại Android thật của mình để test hiệu năng thực tế (native), tôi đã tích hợp sẵn tính năng build và gửi file APK tự động ngay trên khung chat Telegram.
+
+### Cách hoạt động:
+1. Đảm bảo bạn đã chọn một workspace Flutter (chứa tệp `pubspec.yaml`).
+2. Gửi lệnh `/apk` hoặc nhấp vào nút **`APK`** trên menu chính của Bot.
+3. Bot sẽ tự động thực hiện:
+   - Chạy lệnh `flutter build apk --split-per-abi` trên máy host.
+   - Lọc và tìm các file APK đã build (thường là các file tối ưu dung lượng cho từng kiến trúc chip như `app-armeabi-v7a-release.apk` hay `app-arm64-v8a-release.apk` với dung lượng rất nhẹ chỉ khoảng 10-18 MB).
+   - Tự động tải các tệp APK này lên phòng chat Telegram bằng API `sendDocument`.
+4. Bạn chỉ cần nhấn vào tệp APK trong Telegram để tải về điện thoại và cài đặt trực tiếp.
+

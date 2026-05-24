@@ -153,6 +153,11 @@ function createCommandHandler(config, sessionManager, send, answerCallback, atta
       return;
     }
 
+    if (text === '/apk') {
+      await sessionManager.apk(chatId);
+      return;
+    }
+
     if (text.startsWith('/commit ')) {
       await sessionManager.requestCommit(chatId, text.slice('/commit '.length));
       return;
@@ -284,6 +289,10 @@ async function handleCallback(callbackQuery, config, sessionManager, send, answe
     await sessionManager.test(chatId);
     return;
   }
+  if (data === 'apk') {
+    await sessionManager.apk(chatId);
+    return;
+  }
   if (data === 'commit:confirm') {
     await sessionManager.confirmCommit(chatId);
     return;
@@ -338,6 +347,7 @@ function helpText(config) {
     '/diff - show git diff stat',
     '/files - show changed files',
     '/test - run configured test command',
+    '/apk - build and send Flutter APK via Telegram',
     '/commit <message> - request git commit after confirmation',
     '/verbose on|off - show/hide Codex shell events',
     '/reset-task - clear current session state',
@@ -406,7 +416,7 @@ function mainKeyboard(config) {
       inline_keyboard: [
         [{ text: 'Repos', callback_data: 'repos' }, { text: 'Status', callback_data: 'status' }, { text: 'Stop', callback_data: 'stop' }],
         [{ text: 'Read', callback_data: 'mode:read' }, writeButton],
-        [{ text: 'Diff', callback_data: 'diff' }, { text: 'Files', callback_data: 'files' }, { text: 'Test', callback_data: 'test' }],
+        [{ text: 'Diff', callback_data: 'diff' }, { text: 'Files', callback_data: 'files' }, { text: 'Test', callback_data: 'test' }, { text: 'APK', callback_data: 'apk' }],
         [{ text: 'Queue', callback_data: 'queue' }, { text: 'Cancel Queue', callback_data: 'cancel-queue' }, { text: 'Continue', callback_data: 'continue' }],
         [{ text: 'Health', callback_data: 'health' }],
         ...profileButtons,

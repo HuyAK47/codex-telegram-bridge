@@ -13,6 +13,7 @@ function buildBotCommands() {
     { command: 'diff', description: 'Show git diff stat' },
     { command: 'files', description: 'Show changed files' },
     { command: 'test', description: 'Run configured tests' },
+    { command: 'apk', description: 'Build and send Flutter APK via Telegram' },
     { command: 'commit', description: 'Request git commit: /commit <msg>' },
     { command: 'queue', description: 'Show queued tasks' },
     { command: 'cancel_queue', description: 'Clear queued tasks' },
