@@ -213,6 +213,8 @@ Then explicitly switch a chat session with `/mode write`.
 - `429 Too Many Requests`: wait for the rate limit to cool down, reduce queued prompts, or switch to a less busy model/profile if configured.
 - `Not inside a trusted directory`: choose a real git repo with `/repo <alias>`, or set `CODEX_SKIP_GIT_REPO_CHECK=true` only for intentional non-git scratch folders.
 - Read-only/write denial: use `/mode write`, `/work 30m`, or the `Enable write & retry` button. Write mode still requires `ALLOW_WRITE_MODE=true` and a matching `WRITE_REPO_ALIASES` entry.
+- `bwrap` or permission denied errors on Ubuntu 24.04+: see the [Ubuntu bwrap fix guide](docs/ubuntu-bwrap-fix.md) for details on sysctl and AppArmor configuration.
+
 
 ## Notes
 
