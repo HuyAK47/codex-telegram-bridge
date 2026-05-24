@@ -49,7 +49,11 @@ class SessionManager {
   setWorkspace(chatId, value) {
     const session = this.ensure(chatId);
     const requested = this.config.repoAliases.get(value) || value;
-    session.workspace = resolveAllowedWorkspace(requested, this.config.allowlistRoots);
+    const newWorkspace = resolveAllowedWorkspace(requested, this.config.allowlistRoots);
+    if (session.workspace !== newWorkspace) {
+      session.workspace = newWorkspace;
+      session.codexThreadId = '';
+    }
     session.repoAlias = this.config.repoAliases.has(value) ? value : findAliasForWorkspace(this.config, session.workspace);
     session.mode = 'read-only';
     session.writeExpiresAt = 0;
@@ -74,7 +78,11 @@ class SessionManager {
       throw new Error('Mode must be read or write');
     }
     const session = this.ensure(chatId);
-    session.mode = mode === 'write' ? 'workspace-write' : 'read-only';
+    const newMode = mode === 'write' ? 'workspace-write' : 'read-only';
+    if (session.mode !== newMode) {
+      session.mode = newMode;
+      session.codexThreadId = '';
+    }
     if (session.mode === 'read-only') {
       session.writeExpiresAt = 0;
     }
@@ -100,7 +108,11 @@ class SessionManager {
       throw new Error('Write mode is disabled for this repo or server');
     }
     const session = this.ensure(chatId);
-    session.mode = 'workspace-write';
+    const newMode = 'workspace-write';
+    if (session.mode !== newMode) {
+      session.mode = newMode;
+      session.codexThreadId = '';
+    }
     session.writeExpiresAt = Date.now() + this.config.writeModeTtlMs;
     this.persist(chatId, session);
     this.audit.write({ type: 'mode.write.confirmed', chatId, workspace: session.workspace, expiresAt: session.writeExpiresAt });
@@ -111,6 +123,7 @@ class SessionManager {
     if (session.mode === 'workspace-write' && session.writeExpiresAt && Date.now() > session.writeExpiresAt) {
       session.mode = 'read-only';
       session.writeExpiresAt = 0;
+      session.codexThreadId = '';
     }
   }
 

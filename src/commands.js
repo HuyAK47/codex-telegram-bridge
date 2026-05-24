@@ -58,8 +58,10 @@ function createCommandHandler(config, sessionManager, send, answerCallback, atta
       return;
     }
 
-    if (text.startsWith('/set-default ')) {
-      const workspace = sessionManager.setDefaultWorkspace(chatId, text.slice('/set-default '.length).trim());
+    if (text.startsWith('/set-default ') || text.startsWith('/set_default ')) {
+      const isUnderscore = text.startsWith('/set_default ');
+      const prefixLength = isUnderscore ? '/set_default '.length : '/set-default '.length;
+      const workspace = sessionManager.setDefaultWorkspace(chatId, text.slice(prefixLength).trim());
       await send(chatId, `✅ Default repo saved:\n${workspace}`);
       return;
     }
@@ -109,7 +111,7 @@ function createCommandHandler(config, sessionManager, send, answerCallback, atta
       return;
     }
 
-    if (text === '/cancel-queue') {
+    if (text === '/cancel-queue' || text === '/cancel_queue') {
       const cancelled = sessionManager.cancelQueue(chatId);
       await send(chatId, `Cancelled ${cancelled} queued task(s).`);
       return;
@@ -168,7 +170,7 @@ function createCommandHandler(config, sessionManager, send, answerCallback, atta
       return;
     }
 
-    if (text === '/reset-task') {
+    if (text === '/reset-task' || text === '/reset_task') {
       sessionManager.reset(chatId);
       await send(chatId, '✅ Session reset.');
       return;
