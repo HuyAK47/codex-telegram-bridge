@@ -180,6 +180,7 @@ Then explicitly switch a chat session with `/mode write`.
 - `AUDIT_LOG_PATH` enables JSONL logs for repo selection, mode changes, prompts, and command events.
 - `SESSION_STATE_PATH` remembers the last repo/verbose setting per chat, always restoring read-only mode.
 - `CODEX_SHOW_COMMAND_EVENTS=false` keeps Telegram chat clean; use `/verbose on` per session when debugging.
+- **Remote Android UI Testing:** see the [Remote Android UI Guide](docs/remote-android-ui.md) to preview and control Android Emulators/devices from your web browser.
 
 ## Advanced Options
 
