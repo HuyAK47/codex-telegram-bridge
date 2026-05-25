@@ -422,6 +422,70 @@ test('SessionManager commit requires write mode and pending confirmation', async
   assert.match(notices[0].text, /Confirm commit/);
 });
 
+test('SessionManager apk requires confirmed write mode', async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-apk-mode-'));
+  const config = loadConfig({
+    TELEGRAM_BOT_TOKEN: 'token',
+    TELEGRAM_ALLOWED_USER_IDS: '123',
+    WORKSPACE_ALLOWLIST: tempRoot,
+    REPO_ALIASES: `app=${tempRoot}`,
+    ALLOW_WRITE_MODE: 'true',
+    WRITE_REPO_ALIASES: 'app',
+  });
+  fs.writeFileSync(path.join(tempRoot, 'pubspec.yaml'), 'name: demo\n');
+  const manager = new SessionManager(config, () => {});
+
+  manager.setWorkspace(1, 'app');
+
+  await assert.rejects(() => manager.apk(1), /APK build requires confirmed write mode/);
+});
+
+test('SessionManager apk uploads built files through telegram client', async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-apk-upload-'));
+  const apkDir = path.join(tempRoot, 'build/app/outputs/flutter-apk');
+  fs.mkdirSync(apkDir, { recursive: true });
+  fs.writeFileSync(path.join(tempRoot, 'pubspec.yaml'), 'name: demo\n');
+  fs.writeFileSync(path.join(apkDir, 'app-arm64-v8a-release.apk'), 'apk');
+  fs.writeFileSync(path.join(apkDir, 'app.apk'), 'universal');
+
+  const runs = [];
+  const uploads = [];
+  const config = loadConfig({
+    TELEGRAM_BOT_TOKEN: 'token',
+    TELEGRAM_ALLOWED_USER_IDS: '123',
+    WORKSPACE_ALLOWLIST: tempRoot,
+    REPO_ALIASES: `app=${tempRoot}`,
+    ALLOW_WRITE_MODE: 'true',
+    WRITE_REPO_ALIASES: 'app',
+  });
+  const manager = new SessionManager(
+    config,
+    () => {},
+    {
+      runWorkspaceCommand: async (spec, timeoutMs) => {
+        runs.push({ spec, timeoutMs });
+        return { code: 0, output: 'build ok' };
+      },
+      telegramClient: {
+        async sendDocument(chatId, filePath, options) {
+          uploads.push({ chatId, filePath, options });
+        },
+      },
+    }
+  );
+
+  manager.setWorkspace(1, 'app');
+  manager.confirmWriteMode(1);
+  await manager.apk(1);
+
+  assert.equal(runs.length, 1);
+  assert.equal(runs[0].spec.command, '/bin/bash');
+  assert.equal(uploads.length, 1);
+  assert.equal(uploads[0].chatId, 1);
+  assert.equal(path.basename(uploads[0].filePath), 'app-arm64-v8a-release.apk');
+  assert.equal(uploads[0].options.caption, 'Flutter APK: app-arm64-v8a-release.apk');
+});
+
 test('StateStore persists last selected workspace without restoring write mode', () => {
   const statePath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-state-')), 'state.json');
   const store = new StateStore(statePath);

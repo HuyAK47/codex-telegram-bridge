@@ -15,9 +15,11 @@ const {
 } = require('./workspace-tools');
 
 class SessionManager {
-  constructor(config, notifier) {
+  constructor(config, notifier, options) {
     this.config = config;
     this.notifier = notifier;
+    this.telegramClient = options && options.telegramClient ? options.telegramClient : null;
+    this.runWorkspaceCommand = options && options.runWorkspaceCommand ? options.runWorkspaceCommand : runWorkspaceCommand;
     this.sessions = new Map();
     this.audit = new AuditLogger(config.auditLogPath);
     this.stateStore = new StateStore(config.sessionStatePath);
@@ -409,9 +411,14 @@ class SessionManager {
 
   async apk(chatId) {
     const session = this.requireWorkspace(chatId);
+    if (session.mode !== 'workspace-write') {
+      throw new Error('APK build requires confirmed write mode. Use /mode write first.');
+    }
+    if (!this.telegramClient || typeof this.telegramClient.sendDocument !== 'function') {
+      throw new Error('Telegram document upload is not configured.');
+    }
     const fs = require('fs');
     const path = require('path');
-    const { exec } = require('child_process');
 
     const pubspecPath = path.join(session.workspace, 'pubspec.yaml');
     if (!fs.existsSync(pubspecPath)) {
@@ -425,7 +432,7 @@ class SessionManager {
       cwd: session.workspace
     };
 
-    const result = await runWorkspaceCommand(spec, 300000);
+    const result = await this.runWorkspaceCommand(spec, 300000);
     if (result.code !== 0) {
       this.notifier(chatId, `❌ Build APK thất bại (exit ${result.code}):\n${result.output}`);
       return;
@@ -445,30 +452,15 @@ class SessionManager {
       return;
     }
 
-    const token = this.config.telegramBotToken;
     for (const file of apkFiles) {
       const filePath = path.join(apkDir, file);
       this.notifier(chatId, `📤 Đang gửi file: ${file}...`);
-      await new Promise((resolve) => {
-        const cmd = `curl -s -F chat_id="${chatId}" -F caption="Flutter APK: ${file}" -F document=@"${filePath}" https://api.telegram.org/bot${token}/sendDocument`;
-        exec(cmd, (error, stdout) => {
-          if (error) {
-            this.notifier(chatId, `❌ Gửi file ${file} thất bại: ${error.message}`);
-          } else {
-            try {
-              const res = JSON.parse(stdout);
-              if (!res.ok) {
-                this.notifier(chatId, `❌ Gửi file ${file} thất bại từ Telegram API: ${res.description}`);
-              } else {
-                this.notifier(chatId, `✅ Đã gửi xong: ${file}`);
-              }
-            } catch (e) {
-              this.notifier(chatId, `❌ Gửi file ${file} thất bại (lỗi parse phản hồi): ${stdout}`);
-            }
-          }
-          resolve();
-        });
-      });
+      try {
+        await this.telegramClient.sendDocument(chatId, filePath, { caption: `Flutter APK: ${file}` });
+        this.notifier(chatId, `✅ Đã gửi xong: ${file}`);
+      } catch (error) {
+        this.notifier(chatId, `❌ Gửi file ${file} thất bại: ${redactOutput(error.message)}`);
+      }
     }
   }
 

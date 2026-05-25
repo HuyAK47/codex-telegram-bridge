@@ -23,7 +23,11 @@ async function main() {
     }
   }
 
-  const sessionManager = new SessionManager(config, createSessionNotifier(send, console));
+  const sessionManager = new SessionManager(
+    config,
+    createSessionNotifier(send, console),
+    { telegramClient: telegram }
+  );
   startDashboard(config, sessionManager);
   const handleUpdate = createCommandHandler(
     config,
