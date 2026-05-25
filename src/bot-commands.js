@@ -10,6 +10,7 @@ function buildBotCommands() {
     { command: 'health', description: 'Check bot configuration' },
     { command: 'mode', description: 'Set mode: /mode <read|write>' },
     { command: 'work', description: 'Enable temporary write window: /work <mins>' },
+    { command: 'autoloop', description: 'Toggle auto fix and verify: /autoloop <on|off>' },
     { command: 'diff', description: 'Show git diff stat' },
     { command: 'files', description: 'Show changed files' },
     { command: 'test', description: 'Run configured tests' },

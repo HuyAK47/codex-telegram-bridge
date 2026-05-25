@@ -100,6 +100,18 @@ function createCommandHandler(config, sessionManager, send, answerCallback, atta
       return;
     }
 
+    if (text === '/autoloop on') {
+      sessionManager.setAutoLoop(chatId, true);
+      await send(chatId, '✅ Auto loop enabled.');
+      return;
+    }
+
+    if (text === '/autoloop off') {
+      sessionManager.setAutoLoop(chatId, false);
+      await send(chatId, '✅ Auto loop disabled.');
+      return;
+    }
+
     if (text === '/continue') {
       sessionManager.continueLastTask(chatId);
       return;
@@ -134,7 +146,11 @@ function createCommandHandler(config, sessionManager, send, answerCallback, atta
     }
 
     if (text.startsWith('/run ')) {
-      await sessionManager.runProfileCommand(chatId, text.slice('/run '.length).trim());
+      if (sessionManager.enqueueVerifyCommand) {
+        await sessionManager.enqueueVerifyCommand(chatId, text.slice('/run '.length).trim());
+      } else {
+        await sessionManager.runProfileCommand(chatId, text.slice('/run '.length).trim());
+      }
       return;
     }
 
@@ -149,7 +165,11 @@ function createCommandHandler(config, sessionManager, send, answerCallback, atta
     }
 
     if (text === '/test') {
-      await sessionManager.test(chatId);
+      if (sessionManager.enqueueTest) {
+        await sessionManager.enqueueTest(chatId);
+      } else {
+        await sessionManager.test(chatId);
+      }
       return;
     }
 
@@ -250,6 +270,16 @@ async function handleCallback(callbackQuery, config, sessionManager, send, answe
     sessionManager.enableWriteAndRetry(chatId);
     return;
   }
+  if (data === 'autoloop:on') {
+    sessionManager.setAutoLoop(chatId, true);
+    await send(chatId, '✅ Auto loop enabled.');
+    return;
+  }
+  if (data === 'autoloop:off') {
+    sessionManager.setAutoLoop(chatId, false);
+    await send(chatId, '✅ Auto loop disabled.');
+    return;
+  }
   if (data === 'run:readonly') {
     sessionManager.runReadOnlyLastPrompt(chatId);
     return;
@@ -279,7 +309,11 @@ async function handleCallback(callbackQuery, config, sessionManager, send, answe
     return;
   }
   if (data.startsWith('run:')) {
-    await sessionManager.runProfileCommand(chatId, data.slice('run:'.length));
+    if (sessionManager.enqueueVerifyCommand) {
+      await sessionManager.enqueueVerifyCommand(chatId, data.slice('run:'.length));
+    } else {
+      await sessionManager.runProfileCommand(chatId, data.slice('run:'.length));
+    }
     return;
   }
   if (data === 'diff') {
@@ -291,7 +325,11 @@ async function handleCallback(callbackQuery, config, sessionManager, send, answe
     return;
   }
   if (data === 'test') {
-    await sessionManager.test(chatId);
+    if (sessionManager.enqueueTest) {
+      await sessionManager.enqueueTest(chatId);
+    } else {
+      await sessionManager.test(chatId);
+    }
     return;
   }
   if (data === 'apk') {
@@ -353,6 +391,7 @@ function helpText(config) {
     '/mode read - read-only sandbox',
     writeLine,
     '/work 10m|30m - enable a temporary write window',
+    '/autoloop on|off - toggle automatic fix -> verify retries',
     '/diff - show git diff stat',
     '/files - show changed files',
     '/test - run configured test command',
@@ -412,6 +451,8 @@ function statusText(status) {
     `workspace: ${status.workspace || '(not selected)'}`,
     `mode: ${status.mode}`,
     `running: ${status.running ? 'yes' : 'no'}`,
+    `verify: ${status.verifyRunning ? status.verifyLabel : 'idle'}`,
+    `autoloop: ${status.autoLoopEnabled ? 'on' : 'off'}`,
     `verbose: ${status.verbose ? 'yes' : 'no'}`,
   ].join('\n');
 }
@@ -426,6 +467,7 @@ function mainKeyboard(config) {
       inline_keyboard: [
         [{ text: 'Repos', callback_data: 'repos' }, { text: 'Status', callback_data: 'status' }, { text: 'Stop', callback_data: 'stop' }],
         [{ text: 'Read', callback_data: 'mode:read' }, writeButton],
+        [{ text: 'Auto Loop On', callback_data: 'autoloop:on' }, { text: 'Auto Loop Off', callback_data: 'autoloop:off' }],
         [{ text: 'Diff', callback_data: 'diff' }, { text: 'Files', callback_data: 'files' }, { text: 'Test', callback_data: 'test' }, { text: 'APK', callback_data: 'apk' }],
         [{ text: 'Send last output to Codex', callback_data: 'codex:last-output' }],
         [{ text: 'Queue', callback_data: 'queue' }, { text: 'Cancel Queue', callback_data: 'cancel-queue' }, { text: 'Continue', callback_data: 'continue' }],

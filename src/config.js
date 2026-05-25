@@ -8,6 +8,7 @@ const {
   resolveAllowedWorkspace,
 } = require('./security');
 const { parseRepoProfiles } = require('./repo-profiles');
+const { parseVerifyProfiles } = require('./verify-profiles');
 
 function parseRepoAliases(value, allowlistRoots) {
   const aliases = new Map();
@@ -77,6 +78,10 @@ function loadConfig(env) {
     heartbeatMs: Number(source.HEARTBEAT_MS || 60000),
     codexResumeLast: source.CODEX_RESUME_LAST === 'true',
     repoProfiles: parseRepoProfiles(source.REPO_PROFILES_JSON),
+    verifyProfiles: parseVerifyProfiles(source.VERIFY_PROFILES_JSON),
+    verifyRunnerMode: source.VERIFY_RUNNER_MODE || 'local-shell',
+    maxAutoLoopAttempts: Number(source.MAX_AUTO_LOOP_ATTEMPTS || 3),
+    autoLoopDefault: source.AUTO_LOOP_DEFAULT === 'true',
     dashboardHost: source.DASHBOARD_HOST || '127.0.0.1',
     dashboardPort: Number(source.DASHBOARD_PORT || 0),
     attachmentDir: source.ATTACHMENT_DIR || '',

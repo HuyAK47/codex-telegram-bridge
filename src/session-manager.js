@@ -6,6 +6,9 @@ const { AuditLogger } = require('./audit');
 const { StateStore } = require('./state-store');
 const { promptNeedsWrite } = require('./intent');
 const { getRepoProfile } = require('./repo-profiles');
+const { createVerifyRunner } = require('./verify-runner');
+const { createVerifyJob } = require('./verify-jobs');
+const { resolveVerifyProfile } = require('./verify-profiles');
 const {
   buildDiffCommand,
   buildFilesCommand,
@@ -18,11 +21,21 @@ class SessionManager {
   constructor(config, notifier, options) {
     this.config = config;
     this.notifier = notifier;
+    this.options = options || {};
     this.telegramClient = options && options.telegramClient ? options.telegramClient : null;
     this.runWorkspaceCommand = options && options.runWorkspaceCommand ? options.runWorkspaceCommand : runWorkspaceCommand;
     this.sessions = new Map();
     this.audit = new AuditLogger(config.auditLogPath);
     this.stateStore = new StateStore(config.sessionStatePath);
+    this.verifyRunner = options && options.createVerifyRunner
+      ? options.createVerifyRunner({
+          runJob: this.executeVerifyJob.bind(this),
+          onEvent: this.handleVerifyEvent.bind(this),
+        })
+      : createVerifyRunner({
+          runJob: this.executeVerifyJob.bind(this),
+          onEvent: this.handleVerifyEvent.bind(this),
+        });
   }
 
   ensure(chatId) {
@@ -41,6 +54,11 @@ class SessionManager {
         pendingCommitMessage: '',
         lastPrompt: '',
         lastWorkspaceCommand: null,
+        verifyJob: null,
+        verifyQueue: [],
+        autoLoopEnabled: this.config.autoLoopDefault,
+        autoLoopAttempts: 0,
+        pendingVerifyRequest: null,
         queue: [],
         heartbeatTimer: null,
         startedAt: 0,
@@ -139,6 +157,11 @@ class SessionManager {
       running: Boolean(session.running),
       verbose: session.verbose,
       queueLength: session.queue.length,
+      verifyRunning: Boolean(session.verifyJob),
+      verifyLabel: session.verifyJob ? session.verifyJob.label : '',
+      verifyQueueLength: session.verifyQueue.length,
+      autoLoopEnabled: session.autoLoopEnabled,
+      autoLoopAttempts: session.autoLoopAttempts,
     };
   }
 
@@ -164,6 +187,7 @@ class SessionManager {
 
     const safePrompt = validateTelegramText(prompt, this.config.maxPromptChars);
     this.recordPromptForRetry(chatId, safePrompt);
+    this.prepareAutoVerifyForPrompt(session, safePrompt);
     this.audit.write({ type: 'codex.started', chatId, workspace: session.workspace, mode: session.mode, prompt: safePrompt.slice(0, 500) });
     const child = runCodexOnce({
       codexBin: this.config.codexBin,
@@ -231,6 +255,7 @@ class SessionManager {
       this.offerWriteRetryIfReadOnlyDenied(chatId, stderrBuffer);
       if (code === 0 && !signal) {
         this.notifier(chatId, 'Task actions:', taskActionsKeyboard());
+        this.maybeRunPendingVerify(chatId, session);
       }
       this.runNextQueued(chatId);
     });
@@ -340,6 +365,17 @@ class SessionManager {
     this.submitPrompt(chatId, `Tiếp tục task trước một cách cụ thể, không hỏi lại “1,2,3” nếu chúng đã nằm trong context trước. Prompt trước: ${session.lastPrompt}${priorAnswer}`);
   }
 
+  setAutoLoop(chatId, enabled) {
+    const session = this.ensure(chatId);
+    session.autoLoopEnabled = Boolean(enabled);
+    if (!session.autoLoopEnabled) {
+      session.pendingVerifyRequest = null;
+      session.autoLoopAttempts = 0;
+    }
+    this.persist(chatId, session);
+    return session.autoLoopEnabled;
+  }
+
   offerWriteRetryIfReadOnlyDenied(chatId, text) {
     const session = this.ensure(chatId);
     if (session.mode !== 'read-only' || !session.lastPrompt) {
@@ -408,6 +444,18 @@ class SessionManager {
     const profile = getRepoProfile(this.config, session.repoAlias || '');
     const testCommand = profile.testCommand || this.config.testCommands.get(session.repoAlias || '') || this.config.testCommands.get('*');
     await this.runAndNotify(chatId, 'Test', buildTestCommand(session.workspace, testCommand));
+  }
+
+  async enqueueTest(chatId) {
+    const session = this.requireWorkspace(chatId);
+    const resolved = resolveVerifyProfile(this.config, session, 'default-test');
+    return this.enqueueVerifyJob(chatId, {
+      label: 'Test',
+      cwd: resolved.cwd,
+      command: resolved.command,
+      successText: resolved.successText,
+      sourcePrompt: session.lastPrompt,
+    });
   }
 
   async apk(chatId) {
@@ -482,6 +530,21 @@ class SessionManager {
     this.ask(chatId, buildLastCommandPrompt(session.lastWorkspaceCommand, this.config.maxPromptChars));
   }
 
+  async enqueueVerifyCommand(chatId, name) {
+    const session = this.requireWorkspace(chatId);
+    const profile = getRepoProfile(this.config, session.repoAlias || '');
+    if (!profile.commands || !profile.commands[name]) {
+      throw new Error(`No profile command configured: ${name}`);
+    }
+    return this.enqueueVerifyJob(chatId, {
+      label: `Profile command: ${name}`,
+      cwd: session.workspace,
+      command: profile.commands[name],
+      successText: '',
+      sourcePrompt: session.lastPrompt,
+    });
+  }
+
   auditTail(limit) {
     return this.audit.readTail(limit || 20);
   }
@@ -501,6 +564,10 @@ class SessionManager {
         mode: entry[1].mode,
         running: Boolean(entry[1].running),
         queueLength: entry[1].queue.length,
+        verifyRunning: Boolean(entry[1].verifyJob),
+        verifyLabel: entry[1].verifyJob ? entry[1].verifyJob.label : '',
+        verifyQueueLength: entry[1].verifyQueue.length,
+        autoLoopEnabled: entry[1].autoLoopEnabled,
       });
     }
     return { sessions };
@@ -549,7 +616,7 @@ class SessionManager {
   async runAndNotify(chatId, label, spec) {
     this.audit.write({ type: 'workspace.command.started', chatId, label, command: spec.command, args: spec.args });
     this.notifier(chatId, `▶️ ${label} started`);
-    const result = await runWorkspaceCommand(spec, this.config.workspaceCommandTimeoutMs);
+    const result = await this.runWorkspaceCommand(spec, this.config.workspaceCommandTimeoutMs);
     const session = this.ensure(chatId);
     session.lastWorkspaceCommand = {
       label,
@@ -573,6 +640,124 @@ class SessionManager {
     }
     if (info.assistantText) {
       session.lastAssistantText = info.assistantText;
+    }
+  }
+
+  async enqueueVerifyJob(chatId, fields) {
+    const session = this.requireWorkspace(chatId);
+    const job = createVerifyJob({
+      id: buildVerifyJobId(),
+      chatId: chatId,
+      label: fields.label,
+      repoAlias: session.repoAlias,
+      workspace: session.workspace,
+      cwd: fields.cwd || session.workspace,
+      command: fields.command,
+      successText: fields.successText || '',
+      sourcePrompt: fields.sourcePrompt || session.lastPrompt,
+      attempts: session.autoLoopAttempts,
+    });
+    await this.verifyRunner.enqueue(job);
+    return job;
+  }
+
+  whenVerifyIdle() {
+    return this.verifyRunner.whenIdle();
+  }
+
+  async executeVerifyJob(job) {
+    return this.runWorkspaceCommand({
+      command: '/bin/bash',
+      args: ['-lc', job.command],
+      cwd: job.cwd,
+    }, this.config.workspaceCommandTimeoutMs);
+  }
+
+  async handleVerifyEvent(event) {
+    const job = event.job;
+    const session = this.ensure(job.chatId);
+    if (event.type === 'verify.queued') {
+      session.verifyQueue.push({ id: job.id, label: job.label, command: job.command });
+      this.persist(job.chatId, session);
+      this.notifier(job.chatId, `🧪 Queued verify: ${job.label}`);
+      return;
+    }
+    if (event.type === 'verify.started') {
+      session.verifyQueue = session.verifyQueue.filter((item) => item.id !== job.id);
+      session.verifyJob = job;
+      this.persist(job.chatId, session);
+      this.audit.write({ type: 'verify.started', chatId: job.chatId, label: job.label, command: job.command });
+      this.notifier(job.chatId, `🧪 Verify started: ${job.label}`);
+      return;
+    }
+    if (event.type === 'verify.finished') {
+      session.verifyJob = null;
+      session.lastWorkspaceCommand = {
+        label: job.label,
+        command: job.command,
+        code: event.result.code,
+        output: event.result.output,
+      };
+      this.persist(job.chatId, session);
+      this.audit.write({ type: 'verify.finished', chatId: job.chatId, label: job.label, code: event.result.code });
+      this.notifier(job.chatId, `${event.result.code === 0 ? '✅' : '❌'} ${job.label} exit ${event.result.code}\n${event.result.output}`, verifyResultKeyboard());
+      if (event.result.code === 0) {
+        if (job.successText) {
+          this.notifier(job.chatId, job.successText);
+        }
+        session.autoLoopAttempts = 0;
+        session.pendingVerifyRequest = null;
+        this.persist(job.chatId, session);
+        return;
+      }
+      if (session.autoLoopEnabled && session.autoLoopAttempts < this.config.maxAutoLoopAttempts) {
+        session.autoLoopAttempts += 1;
+        session.pendingVerifyRequest = {
+          label: job.label,
+          cwd: job.cwd,
+          command: job.command,
+          successText: job.successText || '',
+        };
+        this.persist(job.chatId, session);
+        this.ask(job.chatId, buildLastCommandPrompt({
+          label: job.label,
+          command: job.command,
+          code: event.result.code,
+          output: event.result.output,
+        }, this.config.maxPromptChars));
+      }
+    }
+  }
+
+  prepareAutoVerifyForPrompt(session, prompt) {
+    if (!session.autoLoopEnabled) {
+      return;
+    }
+    if (!promptNeedsWrite(prompt)) {
+      return;
+    }
+    session.pendingVerifyRequest = {
+      type: 'default-test',
+    };
+  }
+
+  maybeRunPendingVerify(chatId, session) {
+    if (!session.pendingVerifyRequest) {
+      return;
+    }
+    const request = session.pendingVerifyRequest;
+    session.pendingVerifyRequest = null;
+    this.persist(chatId, session);
+    if (request.type === 'default-test') {
+      this.enqueueTest(chatId).catch((error) => {
+        this.notifier(chatId, `❌ Verify enqueue failed: ${redactOutput(error.message)}`);
+      });
+      return;
+    }
+    if (request.command) {
+      this.enqueueVerifyJob(chatId, request).catch((error) => {
+        this.notifier(chatId, `❌ Verify enqueue failed: ${redactOutput(error.message)}`);
+      });
     }
   }
 }
@@ -607,6 +792,10 @@ function buildLastCommandPrompt(lastCommand, maxPromptChars) {
   const budget = Math.max(1000, Number(maxPromptChars || 20000) - header.length - 100);
   const output = String(lastCommand.output || '').slice(-budget);
   return `${header}\n${output}`;
+}
+
+function buildVerifyJobId() {
+  return `verify-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function findAliasForWorkspace(config, workspace) {

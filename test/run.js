@@ -16,6 +16,8 @@ const { formatCodexJsonLine } = require('../src/codex');
 const { createCommandHandler } = require('../src/commands');
 const { SessionManager } = require('../src/session-manager');
 const { StateStore } = require('../src/state-store');
+const { parseVerifyProfiles, resolveVerifyProfile } = require('../src/verify-profiles');
+const { createVerifyRunner } = require('../src/verify-runner');
 const { buildSmartErrorResponse } = require('../src/smart-errors');
 const { createSessionNotifier } = require('../src/notifier');
 const { promptNeedsWrite } = require('../src/intent');
@@ -272,7 +274,7 @@ test('help and status messages include quick action keyboards', async () => {
       allowWriteMode: true,
       repoAliases: new Map([['chess', '/repo/chess']]),
     },
-    { status() { return { workspace: '/repo/chess', mode: 'read-only', running: false, verbose: false }; } },
+    { status() { return { workspace: '/repo/chess', mode: 'read-only', running: false, verbose: false, verifyRunning: true, verifyLabel: 'Test', autoLoopEnabled: true }; } },
     async (chatId, text, options) => sends.push({ chatId, text, options })
   );
 
@@ -282,6 +284,8 @@ test('help and status messages include quick action keyboards', async () => {
   assert.equal(sends.length, 2);
   assert.ok(sends[0].options.reply_markup.inline_keyboard.length > 0);
   assert.ok(sends[1].options.reply_markup.inline_keyboard.length > 0);
+  assert.match(sends[1].text, /verify: Test/);
+  assert.match(sends[1].text, /autoloop: on/);
 });
 
 test('repo list returns picker buttons', async () => {
@@ -574,6 +578,32 @@ test('command handler supports work windows and write retry callback', async () 
   ]);
 });
 
+test('command handler supports toggling auto loop', async () => {
+  const calls = [];
+  const sends = [];
+  const handler = createCommandHandler(
+    { allowedUserIds: new Set([123]), maxPromptChars: 20000, allowWriteMode: true },
+    {
+      setAutoLoop(chatId, enabled) {
+        calls.push({ chatId, enabled });
+        return enabled;
+      },
+    },
+    async (chatId, text) => sends.push({ chatId, text }),
+    async () => {}
+  );
+
+  await handler({ message: { from: { id: 123 }, chat: { id: 456 }, text: '/autoloop on' } });
+  await handler({ callback_query: { id: 'cb1', from: { id: 123 }, message: { chat: { id: 456 } }, data: 'autoloop:off' } });
+
+  assert.deepEqual(calls, [
+    { chatId: 456, enabled: true },
+    { chatId: 456, enabled: false },
+  ]);
+  assert.match(sends[0].text, /Auto loop enabled/);
+  assert.match(sends[1].text, /Auto loop disabled/);
+});
+
 test('smart errors include action buttons for common setup problems', () => {
   const noRepo = buildSmartErrorResponse('No workspace selected. Use /repos first.');
   assert.match(noRepo.text, /Choose a repo/);
@@ -662,6 +692,58 @@ test('parseKeyValueMap allows wildcard fallback key', () => {
   assert.equal(map.get('*'), 'npm test');
 });
 
+test('verify profiles can target a subdirectory and shell command', () => {
+  const profiles = parseVerifyProfiles('{"chess-mobile":{"cwd":"mobile","command":"flutter test","successText":"green"}}');
+
+  assert.equal(profiles.get('chess-mobile').cwd, 'mobile');
+  assert.equal(profiles.get('chess-mobile').command, 'flutter test');
+  assert.equal(profiles.get('chess-mobile').successText, 'green');
+});
+
+test('verify profile resolver uses repo alias profile and workspace-relative cwd', () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-verify-profile-'));
+  const config = loadConfig({
+    TELEGRAM_BOT_TOKEN: 'token',
+    TELEGRAM_ALLOWED_USER_IDS: '123',
+    WORKSPACE_ALLOWLIST: tempRoot,
+    REPO_ALIASES: `chess=${tempRoot}`,
+    VERIFY_PROFILES_JSON: '{"chess":{"cwd":"mobile","command":"flutter test","successText":"All green"}}',
+  });
+  const session = {
+    workspace: tempRoot,
+    repoAlias: 'chess',
+  };
+
+  const profile = resolveVerifyProfile(config, session, 'default-test');
+
+  assert.equal(profile.name, 'chess');
+  assert.equal(profile.command, 'flutter test');
+  assert.equal(profile.cwd, path.join(tempRoot, 'mobile'));
+  assert.equal(profile.successText, 'All green');
+});
+
+test('verify runner reports queued, started, and finished events', async () => {
+  const events = [];
+  const runner = createVerifyRunner({
+    runJob: async (job) => ({ code: 1, output: `failed ${job.id}` }),
+    onEvent: async (event) => {
+      events.push(event.type);
+    },
+  });
+
+  const job = await runner.enqueue({
+    id: 'job-1',
+    label: 'Flutter Test',
+    cwd: '/repo/mobile',
+    command: 'flutter test',
+  });
+
+  await runner.whenIdle();
+
+  assert.equal(job.id, 'job-1');
+  assert.deepEqual(events, ['verify.queued', 'verify.started', 'verify.finished']);
+});
+
 test('SessionManager queues prompts while a task is running', () => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-queue-'));
   const notices = [];
@@ -679,6 +761,42 @@ test('SessionManager queues prompts while a task is running', () => {
 
   assert.equal(session.queue.length, 1);
   assert.match(notices[0].text, /queued/i);
+});
+
+test('SessionManager tracks active verify jobs in status output', async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-verify-status-'));
+  let resolveJob;
+  const started = [];
+  const config = loadConfig({
+    TELEGRAM_BOT_TOKEN: 'token',
+    TELEGRAM_ALLOWED_USER_IDS: '123',
+    WORKSPACE_ALLOWLIST: tempRoot,
+    REPO_ALIASES: `chess=${tempRoot}`,
+    VERIFY_PROFILES_JSON: '{"chess":{"cwd":".","command":"flutter test"}}',
+  });
+  const manager = new SessionManager(config, () => {}, {
+    createVerifyRunner: (deps) => createVerifyRunner({
+      runJob: async (job) => {
+        started.push(job.label);
+        return new Promise((resolve) => {
+          resolveJob = () => resolve({ code: 0, output: 'ok' });
+        });
+      },
+      onEvent: deps.onEvent,
+    }),
+  });
+  manager.setWorkspace(1, 'chess');
+
+  await manager.enqueueTest(1);
+  const statusWhileRunning = manager.status(1);
+  resolveJob();
+  await manager.whenVerifyIdle();
+  const statusAfter = manager.status(1);
+
+  assert.deepEqual(started, ['Test']);
+  assert.equal(statusWhileRunning.verifyRunning, true);
+  assert.equal(statusWhileRunning.verifyLabel, 'Test');
+  assert.equal(statusAfter.verifyRunning, false);
 });
 
 test('SessionManager auto asks for write confirmation on write-like prompts', () => {
@@ -699,6 +817,35 @@ test('SessionManager auto asks for write confirmation on write-like prompts', ()
 
   assert.match(notices[0].text, /needs write access/i);
   assert.equal(notices[0].options.reply_markup.inline_keyboard[0][0].callback_data, 'mode:write:retry');
+});
+
+test('SessionManager auto loop sends failed verify output back to Codex', async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-auto-loop-'));
+  const prompts = [];
+  const config = loadConfig({
+    TELEGRAM_BOT_TOKEN: 'token',
+    TELEGRAM_ALLOWED_USER_IDS: '123',
+    WORKSPACE_ALLOWLIST: tempRoot,
+    REPO_ALIASES: `chess=${tempRoot}`,
+    VERIFY_PROFILES_JSON: '{"chess":{"cwd":".","command":"flutter test"}}',
+    MAX_AUTO_LOOP_ATTEMPTS: '2',
+    AUTO_LOOP_DEFAULT: 'true',
+  });
+  const manager = new SessionManager(config, () => {}, {
+    createVerifyRunner: (deps) => createVerifyRunner({
+      runJob: async () => ({ code: 1, output: 'Expected true, got false' }),
+      onEvent: deps.onEvent,
+    }),
+  });
+  manager.ask = (chatId, prompt) => prompts.push({ chatId, prompt });
+  manager.setWorkspace(1, 'chess');
+
+  await manager.enqueueTest(1);
+  await manager.whenVerifyIdle();
+
+  assert.equal(prompts.length, 1);
+  assert.match(prompts[0].prompt, /Expected true, got false/);
+  assert.equal(manager.status(1).autoLoopAttempts, 1);
 });
 
 test('attachment helpers choose largest image and create safe local paths', () => {
@@ -784,6 +931,7 @@ test('bot commands include main mobile commands', () => {
   assert.equal(names.includes('logs'), true);
   assert.equal(names.includes('queue'), true);
   assert.equal(names.includes('codex-last'), true);
+  assert.equal(names.includes('autoloop'), true);
 });
 
 test('audit logger can read recent redacted lines', () => {
