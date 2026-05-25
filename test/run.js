@@ -783,6 +783,7 @@ test('bot commands include main mobile commands', () => {
   assert.equal(names.includes('health'), true);
   assert.equal(names.includes('logs'), true);
   assert.equal(names.includes('queue'), true);
+  assert.equal(names.includes('codex-last'), true);
 });
 
 test('audit logger can read recent redacted lines', () => {
@@ -817,6 +818,52 @@ test('SessionManager can cancel queue and run repo profile commands', async () =
 
   assert.equal(session.queue.length, 0);
   assert.equal(notices.some((notice) => /Profile command/.test(notice.text)), true);
+});
+
+test('SessionManager can hand the last verify output back to Codex', async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-verify-loop-'));
+  const notices = [];
+  const prompts = [];
+  const config = loadConfig({
+    TELEGRAM_BOT_TOKEN: 'token',
+    TELEGRAM_ALLOWED_USER_IDS: '123',
+    WORKSPACE_ALLOWLIST: tempRoot,
+    REPO_ALIASES: `mobile=${tempRoot}`,
+    REPO_PROFILES_JSON: '{"mobile":{"commands":{"Flutter Test":"printf flutter-failed && exit 1"}}}',
+  });
+  const manager = new SessionManager(config, (chatId, text, options) => notices.push({ chatId, text, options }));
+  manager.ask = (chatId, prompt) => prompts.push({ chatId, prompt });
+  manager.setWorkspace(1, 'mobile');
+
+  await manager.runProfileCommand(1, 'Flutter Test');
+  manager.submitLastCommandOutputToCodex(1);
+
+  const resultNotice = notices.find((notice) => /Profile command: Flutter Test exit 1/.test(notice.text));
+  assert.equal(resultNotice.options.reply_markup.inline_keyboard[0][0].callback_data, 'codex:last-output');
+  assert.equal(prompts.length, 1);
+  assert.match(prompts[0].prompt, /Last verification command/);
+  assert.match(prompts[0].prompt, /Flutter Test/);
+  assert.match(prompts[0].prompt, /flutter-failed/);
+});
+
+test('command handler supports sending last verify output to Codex', async () => {
+  const calls = [];
+  const handler = createCommandHandler(
+    { allowedUserIds: new Set([123]), maxPromptChars: 20000, allowWriteMode: true },
+    {
+      submitLastCommandOutputToCodex(chatId) { calls.push({ method: 'last-output', chatId }); },
+    },
+    async () => {},
+    async () => {}
+  );
+
+  await handler({ message: { from: { id: 123 }, chat: { id: 456 }, text: '/codex-last' } });
+  await handler({ callback_query: { id: 'cb1', from: { id: 123 }, message: { chat: { id: 456 } }, data: 'codex:last-output' } });
+
+  assert.deepEqual(calls, [
+    { method: 'last-output', chatId: 456 },
+    { method: 'last-output', chatId: 456 },
+  ]);
 });
 
 let failures = 0;

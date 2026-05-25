@@ -15,6 +15,7 @@ function buildBotCommands() {
     { command: 'test', description: 'Run configured tests' },
     { command: 'apk', description: 'Build and send Flutter APK via Telegram' },
     { command: 'commit', description: 'Request git commit: /commit <msg>' },
+    { command: 'codex-last', description: 'Send last verify output to Codex' },
     { command: 'queue', description: 'Show queued tasks' },
     { command: 'cancel_queue', description: 'Clear queued tasks' },
     { command: 'logs', description: 'Show recent audit lines' },

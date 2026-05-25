@@ -40,6 +40,7 @@ class SessionManager {
         writeExpiresAt: 0,
         pendingCommitMessage: '',
         lastPrompt: '',
+        lastWorkspaceCommand: null,
         queue: [],
         heartbeatTimer: null,
         startedAt: 0,
@@ -473,6 +474,14 @@ class SessionManager {
     await this.runAndNotify(chatId, `Profile command: ${name}`, buildTestCommand(session.workspace, profile.commands[name]));
   }
 
+  submitLastCommandOutputToCodex(chatId) {
+    const session = this.requireWorkspace(chatId);
+    if (!session.lastWorkspaceCommand) {
+      throw new Error('No previous verify command output to send to Codex.');
+    }
+    this.ask(chatId, buildLastCommandPrompt(session.lastWorkspaceCommand, this.config.maxPromptChars));
+  }
+
   auditTail(limit) {
     return this.audit.readTail(limit || 20);
   }
@@ -541,8 +550,15 @@ class SessionManager {
     this.audit.write({ type: 'workspace.command.started', chatId, label, command: spec.command, args: spec.args });
     this.notifier(chatId, `▶️ ${label} started`);
     const result = await runWorkspaceCommand(spec, this.config.workspaceCommandTimeoutMs);
+    const session = this.ensure(chatId);
+    session.lastWorkspaceCommand = {
+      label,
+      command: formatCommandSpec(spec),
+      code: result.code,
+      output: result.output,
+    };
     this.audit.write({ type: 'workspace.command.finished', chatId, label, code: result.code });
-    this.notifier(chatId, `${result.code === 0 ? '✅' : '❌'} ${label} exit ${result.code}\n${result.output}`);
+    this.notifier(chatId, `${result.code === 0 ? '✅' : '❌'} ${label} exit ${result.code}\n${result.output}`, verifyResultKeyboard());
   }
 
   persist(chatId, session) {
@@ -562,6 +578,36 @@ class SessionManager {
 }
 
 module.exports = { SessionManager };
+
+function formatCommandSpec(spec) {
+  return [spec.command].concat(spec.args || []).join(' ');
+}
+
+function verifyResultKeyboard() {
+  return {
+    reply_markup: {
+      inline_keyboard: [[
+        { text: 'Send output to Codex', callback_data: 'codex:last-output' },
+        { text: 'Continue', callback_data: 'continue' },
+      ]],
+    },
+  };
+}
+
+function buildLastCommandPrompt(lastCommand, maxPromptChars) {
+  const header = [
+    'Last verification command finished. Inspect the output, explain the root cause, and make the smallest safe code change needed. Then ask me to rerun the same bridge verify command.',
+    '',
+    `Label: ${lastCommand.label}`,
+    `Command: ${lastCommand.command}`,
+    `Exit code: ${lastCommand.code}`,
+    '',
+    'Output:',
+  ].join('\n');
+  const budget = Math.max(1000, Number(maxPromptChars || 20000) - header.length - 100);
+  const output = String(lastCommand.output || '').slice(-budget);
+  return `${header}\n${output}`;
+}
 
 function findAliasForWorkspace(config, workspace) {
   if (!workspace || !config.repoAliases) {

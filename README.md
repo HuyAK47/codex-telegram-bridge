@@ -137,6 +137,7 @@ npm run setup-telegram
 - `/logs` shows recent redacted audit lines.
 - `/cleanup` removes old Telegram attachment files.
 - `/run <name>` runs a repo profile command such as `Analyze` or `Flutter Test`.
+- `/codex-last` sends the last `/test` or `/run` output back into Codex as the next task.
 - `/ask <prompt>` starts one non-interactive Codex run.
 - Any normal chat message also starts a Codex run, so `/ask` is optional after setup.
 - `/status` shows workspace, mode, and running state.
@@ -177,6 +178,8 @@ Then explicitly switch a chat session with `/mode write`.
 - Send a Telegram image, then send a prompt; the image is passed to Codex with `--image` when `ATTACHMENT_DIR` is configured.
 - After a successful task, the bot shows action buttons for `Continue`, `Work 30m`, `Diff`, `Files`, `Test`, and `Status`.
 - `TEST_COMMANDS` maps repo aliases to commands, for example `chess=flutter test,*=npm test`.
+- Keep heavy verification commands such as Flutter, Gradle, Maven, Docker, and Fastlane in `/test` or `/run` profiles. They run directly from the bridge process instead of through Codex command sandboxing.
+- After `/test` or `/run` finishes, tap `Send output to Codex` or use `/codex-last` to ask Codex to inspect the latest verify output and make the next code fix.
 - `AUDIT_LOG_PATH` enables JSONL logs for repo selection, mode changes, prompts, and command events.
 - `SESSION_STATE_PATH` remembers the last repo/verbose setting per chat, always restoring read-only mode.
 - `CODEX_SHOW_COMMAND_EVENTS=false` keeps Telegram chat clean; use `/verbose on` per session when debugging.
@@ -188,6 +191,7 @@ Then explicitly switch a chat session with `/mode write`.
 - `CODEX_RESUME_LAST=true` switches Codex calls to `codex exec resume --last --json`.
 - The bot stores Codex `thread_id` per chat when available and resumes that exact thread for follow-up prompts. This makes short replies like “làm 1,2,3” more reliable than starting a fresh Codex run.
 - `REPO_PROFILES_JSON` supports per-repo defaults, for example `{"chess":{"testCommand":"flutter test","defaultPrompt":"You are working on a Flutter chess app."}}`.
+- A mixed Flutter/Gradle setup can define commands like `{"mobile":{"commands":{"Analyze":"flutter analyze","Test":"flutter test"}},"backend":{"commands":{"Compile":"./gradlew --no-daemon compileJava","Test":"./gradlew --no-daemon test"}}}`.
 - `DASHBOARD_HOST=127.0.0.1` and `DASHBOARD_PORT=8787` enable a local JSON dashboard at `/health` and `/sessions`.
 - `ATTACHMENT_DIR=/tmp/codex-telegram-bridge-attachments` stores Telegram images before passing them to Codex.
 - `ATTACHMENT_MAX_AGE_MS=86400000` controls how old files must be before `/cleanup` deletes them.
