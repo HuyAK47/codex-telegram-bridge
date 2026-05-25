@@ -1,5 +1,6 @@
 'use strict';
 
+const fs = require('fs');
 const path = require('path');
 const { getRepoProfile } = require('./repo-profiles');
 
@@ -43,18 +44,40 @@ function resolveVerifyProfile(config, session, requestedName) {
   return {
     name: session.repoAlias || name,
     label: 'Test',
-    cwd: session.workspace,
+    cwd: resolveProfileCwd(session.workspace, profile),
     command: command,
     successText: '',
     kind: 'shell',
   };
 }
 
+function resolveProfileCwd(workspace, profile) {
+  const relativeCwd = profile && profile.cwd ? profile.cwd : '';
+  if (!relativeCwd || relativeCwd === '.') {
+    return workspace;
+  }
+  if (path.isAbsolute(relativeCwd)) {
+    throw new Error('Profile cwd must be workspace-relative');
+  }
+  const root = fs.realpathSync(workspace);
+  const cwd = path.resolve(root, relativeCwd);
+  const lexicalRelative = path.relative(root, cwd);
+  if (lexicalRelative.startsWith('..') || path.isAbsolute(lexicalRelative)) {
+    throw new Error('Profile cwd escapes workspace');
+  }
+  if (!fs.existsSync(cwd)) {
+    return cwd;
+  }
+  const realCwd = fs.realpathSync(cwd);
+  const realRelative = path.relative(root, realCwd);
+  if (realRelative.startsWith('..') || path.isAbsolute(realRelative)) {
+    throw new Error('Profile cwd escapes workspace');
+  }
+  return realCwd;
+}
+
 function buildResolvedProfile(name, entry, session) {
-  const relativeCwd = entry.cwd || '';
-  const cwd = relativeCwd && relativeCwd !== '.'
-    ? path.resolve(session.workspace, relativeCwd)
-    : session.workspace;
+  const cwd = resolveProfileCwd(session.workspace, entry);
   return {
     name: name,
     label: entry.label || 'Test',

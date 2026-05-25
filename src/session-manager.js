@@ -9,11 +9,14 @@ const { getRepoProfile } = require('./repo-profiles');
 const { createVerifyRunner } = require('./verify-runner');
 const { createVerifyJob } = require('./verify-jobs');
 const { resolveVerifyProfile } = require('./verify-profiles');
+const { appendRepoNote, prependRepoNotes, readRepoNotes } = require('./repo-notes');
 const {
   buildDiffCommand,
   buildFilesCommand,
   buildTestCommand,
+  buildBranchCommand,
   buildCommitCommand,
+  buildPrReadyCommand,
   runWorkspaceCommand,
 } = require('./workspace-tools');
 
@@ -24,6 +27,7 @@ class SessionManager {
     this.options = options || {};
     this.telegramClient = options && options.telegramClient ? options.telegramClient : null;
     this.runWorkspaceCommand = options && options.runWorkspaceCommand ? options.runWorkspaceCommand : runWorkspaceCommand;
+    this.runCodexOnce = options && options.runCodexOnce ? options.runCodexOnce : runCodexOnce;
     this.sessions = new Map();
     this.audit = new AuditLogger(config.auditLogPath);
     this.stateStore = new StateStore(config.sessionStatePath);
@@ -52,8 +56,11 @@ class SessionManager {
         lastAssistantText: '',
         writeExpiresAt: 0,
         pendingCommitMessage: '',
+        pendingPlanPrompt: '',
+        pendingPlanText: '',
         lastPrompt: '',
         lastWorkspaceCommand: null,
+        latestVerifyResult: null,
         verifyJob: null,
         verifyQueue: [],
         autoLoopEnabled: this.config.autoLoopDefault,
@@ -153,6 +160,7 @@ class SessionManager {
     this.refreshMode(session);
     return {
       workspace: session.workspace,
+      repoAlias: session.repoAlias,
       mode: session.mode,
       running: Boolean(session.running),
       verbose: session.verbose,
@@ -162,7 +170,42 @@ class SessionManager {
       verifyQueueLength: session.verifyQueue.length,
       autoLoopEnabled: session.autoLoopEnabled,
       autoLoopAttempts: session.autoLoopAttempts,
+      workflowState: this.workflowState(session),
+      pendingCommit: Boolean(session.pendingCommitMessage),
+      pendingPlan: Boolean(session.pendingPlanPrompt),
+      lastCommandLabel: session.lastWorkspaceCommand ? session.lastWorkspaceCommand.label : '',
+      latestVerifyResult: session.latestVerifyResult,
+      repoNotes: this.repoNotesStatus(session),
     };
+  }
+
+  workflowState(session) {
+    if (session.running) {
+      return session.pendingPlanPrompt ? 'planning' : 'coding';
+    }
+    if (session.pendingCommitMessage) {
+      return 'waiting for commit confirmation';
+    }
+    if (session.pendingPlanPrompt) {
+      return 'waiting for plan approval';
+    }
+    if (session.verifyJob) {
+      return 'verifying';
+    }
+    return 'idle';
+  }
+
+  repoNotesStatus(session) {
+    if (!session.workspace) {
+      return { enabled: false, path: '', hasNotes: false };
+    }
+    const profile = getRepoProfile(this.config, session.repoAlias || '');
+    try {
+      const notes = readRepoNotes(session, profile, 1);
+      return { enabled: true, path: profile.notesPath || '.codex-telegram/context.md', hasNotes: Boolean(notes) };
+    } catch (_error) {
+      return { enabled: false, path: '', hasNotes: false };
+    }
   }
 
   stop(chatId) {
@@ -176,7 +219,8 @@ class SessionManager {
     return true;
   }
 
-  ask(chatId, prompt) {
+  ask(chatId, prompt, options) {
+    const settings = options || {};
     const session = this.ensure(chatId);
     if (!session.workspace) {
       throw new Error('No workspace selected. Use /repo <alias-or-path> first.');
@@ -185,14 +229,18 @@ class SessionManager {
       throw new Error('A Codex task is already running. Use /stop before starting another.');
     }
 
-    const safePrompt = validateTelegramText(prompt, this.config.maxPromptChars);
-    this.recordPromptForRetry(chatId, safePrompt);
-    this.prepareAutoVerifyForPrompt(session, safePrompt);
-    this.audit.write({ type: 'codex.started', chatId, workspace: session.workspace, mode: session.mode, prompt: safePrompt.slice(0, 500) });
-    const child = runCodexOnce({
+    const contextPrompt = settings.skipContext ? prompt : this.applyPromptContext(session, prompt);
+    const safePrompt = validateTelegramText(contextPrompt, this.config.maxPromptChars);
+    if (!settings.skipRetryRecord) {
+      this.recordPromptForRetry(chatId, prompt);
+    }
+    this.prepareAutoVerifyForPrompt(session, prompt);
+    const runtimeMode = settings.sandboxMode || session.mode;
+    this.audit.write({ type: settings.auditType || 'codex.started', chatId, workspace: session.workspace, mode: runtimeMode, prompt: safePrompt.slice(0, 500) });
+    const child = this.runCodexOnce({
       codexBin: this.config.codexBin,
       workspace: session.workspace,
-      sandboxMode: session.mode,
+      sandboxMode: runtimeMode,
       extraArgs: this.config.codexExtraArgs,
       skipGitRepoCheck: this.config.codexSkipGitRepoCheck,
       resumeLast: this.config.codexResumeLast,
@@ -200,10 +248,12 @@ class SessionManager {
       imagePaths: session.pendingImagePaths || [],
     });
 
+    session.pendingImagePaths = [];
+    this.persist(chatId, session);
     session.running = child;
     session.startedAt = Date.now();
     this.startHeartbeat(chatId, session);
-    this.notifier(chatId, `▶️ Codex started\nworkspace: ${session.workspace}\nmode: ${session.mode}`);
+    this.notifier(chatId, `▶️ Codex started\nworkspace: ${session.workspace}\nmode: ${runtimeMode}`);
 
     let stdoutRemainder = '';
     let stderrBuffer = '';
@@ -248,7 +298,12 @@ class SessionManager {
         }
       }
       session.running = null;
-      this.audit.write({ type: 'codex.finished', chatId, workspace: session.workspace, code, signal });
+      if (settings.planMode && session.pendingPlanPrompt && session.lastAssistantText) {
+        session.pendingPlanText = session.lastAssistantText;
+        this.persist(chatId, session);
+        this.notifier(chatId, 'Plan actions:', planActionsKeyboard());
+      }
+      this.audit.write({ type: settings.finishAuditType || 'codex.finished', chatId, workspace: session.workspace, code, signal });
       const detail = signal ? `signal ${signal}` : `exit ${code}`;
       const stderr = stderrBuffer.trim() ? `\n${redactOutput(stderrBuffer.trim())}` : '';
       this.notifier(chatId, `⏹️ Codex finished: ${detail}${stderr}`);
@@ -283,7 +338,7 @@ class SessionManager {
       });
       return 'needs_write';
     }
-    this.ask(chatId, this.applyProfilePrompt(session, prompt));
+    this.ask(chatId, prompt);
     return 'started';
   }
 
@@ -293,6 +348,13 @@ class SessionManager {
       return prompt;
     }
     return `${profile.defaultPrompt}\n\n${prompt}`;
+  }
+
+  applyPromptContext(session, prompt) {
+    const profile = getRepoProfile(this.config, session.repoAlias || '');
+    const profiledPrompt = this.applyProfilePrompt(session, prompt);
+    const notes = readRepoNotes(session, profile, Math.min(4000, Math.floor(Number(this.config.maxPromptChars || 20000) / 4)));
+    return prependRepoNotes(profiledPrompt, notes);
   }
 
   runNextQueued(chatId) {
@@ -413,7 +475,7 @@ class SessionManager {
     if (!session.lastPrompt) {
       throw new Error('No previous prompt to run');
     }
-    this.ask(chatId, this.applyProfilePrompt(session, session.lastPrompt));
+    this.ask(chatId, session.lastPrompt);
   }
 
   enableWriteWindow(chatId, minutes) {
@@ -427,6 +489,85 @@ class SessionManager {
     this.persist(chatId, session);
     this.audit.write({ type: 'mode.write.window', chatId, workspace: session.workspace, minutes: safeMinutes });
     return session.mode;
+  }
+
+  async plan(chatId, task) {
+    const session = this.requireWorkspace(chatId);
+    const safeTask = validateTelegramText(task || session.lastPrompt || '', this.config.maxPromptChars);
+    if (!safeTask) {
+      throw new Error('Plan task is required');
+    }
+    session.pendingPlanPrompt = safeTask;
+    session.pendingPlanText = '';
+    this.persist(chatId, session);
+    this.audit.write({ type: 'plan.requested', chatId, workspace: session.workspace, prompt: safeTask.slice(0, 500) });
+    this.ask(chatId, [
+      'Analyze this task, inspect the relevant code, and propose a concrete implementation plan.',
+      'Do not modify files yet. Call out risks, tests, and the smallest safe path.',
+      '',
+      safeTask,
+    ].join('\n'), { sandboxMode: 'read-only', auditType: 'plan.started', finishAuditType: 'plan.finished', planMode: true });
+  }
+
+  approvePlan(chatId) {
+    const session = this.requireWorkspace(chatId);
+    const prompt = session.pendingPlanPrompt;
+    if (!prompt) {
+      throw new Error('No pending plan to approve');
+    }
+    session.pendingPlanPrompt = '';
+    session.pendingPlanText = '';
+    this.persist(chatId, session);
+    this.audit.write({ type: 'plan.approved', chatId, workspace: session.workspace });
+    this.submitPrompt(chatId, prompt);
+  }
+
+  revisePlan(chatId) {
+    const session = this.requireWorkspace(chatId);
+    if (!session.pendingPlanPrompt) {
+      throw new Error('No pending plan to revise');
+    }
+    this.audit.write({ type: 'plan.revise.requested', chatId, workspace: session.workspace });
+    this.ask(chatId, [
+      'Revise the previous implementation plan. Keep this as planning only and do not modify files.',
+      'Make the plan smaller, safer, and more concrete.',
+      '',
+      'Task:',
+      session.pendingPlanPrompt,
+      '',
+      'Previous plan:',
+      session.pendingPlanText || session.lastAssistantText || '(not captured yet)',
+    ].join('\n'), { sandboxMode: 'read-only', auditType: 'plan.revise.started', finishAuditType: 'plan.revise.finished', planMode: true });
+  }
+
+  cancelPlan(chatId) {
+    const session = this.ensure(chatId);
+    session.pendingPlanPrompt = '';
+    session.pendingPlanText = '';
+    this.persist(chatId, session);
+    this.audit.write({ type: 'plan.cancelled', chatId });
+  }
+
+  review(chatId) {
+    this.audit.write({ type: 'review.requested', chatId });
+    this.ask(chatId, 'Review the current git diff in this workspace. Find bugs, regressions, incomplete changes, risky edge cases, and missing tests. Do not modify files.', { sandboxMode: 'read-only', auditType: 'review.started', finishAuditType: 'review.finished' });
+  }
+
+  async summary(chatId) {
+    const session = this.requireWorkspace(chatId);
+    const filesResult = await this.runWorkspaceCommand(buildFilesCommand(session.workspace), this.config.workspaceCommandTimeoutMs);
+    const latest = session.latestVerifyResult || session.lastWorkspaceCommand || null;
+    const lines = [
+      'Task summary',
+      '',
+      `- what changed: ${session.lastAssistantText ? summarizeLine(session.lastAssistantText) : '(no assistant summary captured)'}`,
+      `- current changed files: ${filesResult.output || '(none)'}`,
+      `- latest verify result: ${latest ? `${latest.label} exit ${latest.code}` : '(not run)'}`,
+      `- remaining risks: ${latest && latest.code !== 0 ? 'verification is failing or incomplete' : 'review manually if changes are broad'}`,
+      `- ready to commit: ${latest && latest.code === 0 ? 'likely yes' : 'not yet / unknown'}`,
+    ];
+    this.audit.write({ type: 'summary.generated', chatId, workspace: session.workspace });
+    this.notifier(chatId, lines.join('\n'), summaryKeyboard());
   }
 
   async diff(chatId) {
@@ -468,34 +609,28 @@ class SessionManager {
     }
     const fs = require('fs');
     const path = require('path');
+    const profile = getRepoProfile(this.config, session.repoAlias || '');
+    const command = resolveProfileCommand(profile, ['Build APK', 'APK', 'Flutter APK']) || 'flutter build apk --split-per-abi';
+    const cwd = resolveProfileCwd(session.workspace, profile);
 
-    const pubspecPath = path.join(session.workspace, 'pubspec.yaml');
-    if (!fs.existsSync(pubspecPath)) {
-      throw new Error('Workspace hiện tại không phải là dự án Flutter (thiếu pubspec.yaml)');
-    }
-
-    this.notifier(chatId, '▶️ Bắt đầu build APK (split-per-abi)...');
-    const spec = {
-      command: '/bin/bash',
-      args: ['-lc', 'flutter build apk --split-per-abi'],
-      cwd: session.workspace
-    };
-
-    const result = await this.runWorkspaceCommand(spec, 300000);
+    this.notifier(chatId, `▶️ Bắt đầu build APK: ${command}`);
+    const result = await this.runWorkspaceCommand(buildTestCommand(cwd, command), 300000);
+    session.lastWorkspaceCommand = { label: 'APK', command, code: result.code, output: result.output };
     if (result.code !== 0) {
-      this.notifier(chatId, `❌ Build APK thất bại (exit ${result.code}):\n${result.output}`);
+      this.notifier(chatId, `❌ Build APK thất bại (exit ${result.code}):
+${result.output}`);
       return;
     }
 
     this.notifier(chatId, '✅ Build APK thành công. Đang quét và gửi file APK...');
-    const apkDir = path.join(session.workspace, 'build/app/outputs/flutter-apk');
+    const apkDir = path.join(cwd, 'build/app/outputs/flutter-apk');
     if (!fs.existsSync(apkDir)) {
       this.notifier(chatId, '❌ Không tìm thấy thư mục build APK.');
       return;
     }
 
     const files = fs.readdirSync(apkDir);
-    const apkFiles = files.filter(f => f.endsWith('.apk') && !f.includes('lip-') && f !== 'app.apk');
+    const apkFiles = files.filter((file) => file.endsWith('.apk') && !file.includes('lip-') && file !== 'app.apk');
     if (apkFiles.length === 0) {
       this.notifier(chatId, '❌ Không tìm thấy file APK nào.');
       return;
@@ -513,13 +648,14 @@ class SessionManager {
     }
   }
 
+
   async runProfileCommand(chatId, name) {
     const session = this.requireWorkspace(chatId);
     const profile = getRepoProfile(this.config, session.repoAlias || '');
     if (!profile.commands || !profile.commands[name]) {
       throw new Error(`No profile command configured: ${name}`);
     }
-    await this.runAndNotify(chatId, `Profile command: ${name}`, buildTestCommand(session.workspace, profile.commands[name]));
+    await this.runAndNotify(chatId, `Profile command: ${name}`, buildTestCommand(resolveProfileCwd(session.workspace, profile), profile.commands[name]));
   }
 
   submitLastCommandOutputToCodex(chatId) {
@@ -538,11 +674,49 @@ class SessionManager {
     }
     return this.enqueueVerifyJob(chatId, {
       label: `Profile command: ${name}`,
-      cwd: session.workspace,
+      cwd: resolveProfileCwd(session.workspace, profile),
       command: profile.commands[name],
       successText: '',
       sourcePrompt: session.lastPrompt,
     });
+  }
+
+  addNote(chatId, note) {
+    const session = this.requireWorkspace(chatId);
+    const profile = getRepoProfile(this.config, session.repoAlias || '');
+    const result = appendRepoNote(session, profile, note);
+    this.audit.write({ type: 'note.updated', chatId, workspace: session.workspace, path: result.filePath });
+    this.notifier(chatId, `📝 Repo note saved:
+${result.note}`);
+    return result;
+  }
+
+  async branch(chatId, name) {
+    const session = this.requireWorkspace(chatId);
+    this.refreshMode(session);
+    if (session.mode !== 'workspace-write') {
+      throw new Error('Branch creation requires confirmed write mode. Use /mode write first.');
+    }
+    this.audit.write({ type: 'branch.requested', chatId, workspace: session.workspace, name });
+    await this.runAndNotify(chatId, `Branch: ${name}`, buildBranchCommand(session.workspace, name));
+  }
+
+  async prReady(chatId) {
+    const session = this.requireWorkspace(chatId);
+    const result = await this.runWorkspaceCommand(buildPrReadyCommand(session.workspace), this.config.workspaceCommandTimeoutMs);
+    const verify = session.latestVerifyResult || session.lastWorkspaceCommand;
+    this.audit.write({ type: 'pr_ready.requested', chatId, workspace: session.workspace });
+    this.ask(chatId, [
+      'Create a concise ready-for-PR summary from this local workspace state.',
+      'Include user-facing summary, tests/verification, changed files, risks, and any follow-up needed.',
+      'Do not modify files.',
+      '',
+      'Workspace state:',
+      result.output,
+      '',
+      'Latest verify:',
+      verify ? `${verify.label} exit ${verify.code}\n${String(verify.output || '').slice(-2000)}` : '(not run)',
+    ].join('\n'), { sandboxMode: 'read-only', auditType: 'pr_ready.started', finishAuditType: 'pr_ready.finished' });
   }
 
   auditTail(limit) {
@@ -561,6 +735,7 @@ class SessionManager {
       sessions.push({
         chatId: entry[0],
         workspace: entry[1].workspace,
+        repoAlias: entry[1].repoAlias,
         mode: entry[1].mode,
         running: Boolean(entry[1].running),
         queueLength: entry[1].queue.length,
@@ -568,6 +743,10 @@ class SessionManager {
         verifyLabel: entry[1].verifyJob ? entry[1].verifyJob.label : '',
         verifyQueueLength: entry[1].verifyQueue.length,
         autoLoopEnabled: entry[1].autoLoopEnabled,
+        workflowState: this.workflowState(entry[1]),
+        pendingCommit: Boolean(entry[1].pendingCommitMessage),
+        pendingPlan: Boolean(entry[1].pendingPlanPrompt),
+        lastCommandLabel: entry[1].lastWorkspaceCommand ? entry[1].lastWorkspaceCommand.label : '',
       });
     }
     return { sessions };
@@ -582,7 +761,7 @@ class SessionManager {
     buildCommitCommand(session.workspace, message);
     session.pendingCommitMessage = message.trim();
     this.audit.write({ type: 'commit.requested', chatId, workspace: session.workspace, message: session.pendingCommitMessage });
-    this.notifier(chatId, `⚠️ Confirm commit?\n${session.pendingCommitMessage}`);
+    this.notifier(chatId, `⚠️ Confirm commit?\n${session.pendingCommitMessage}`, commitConfirmKeyboard());
   }
 
   async confirmCommit(chatId) {
@@ -625,6 +804,10 @@ class SessionManager {
       output: result.output,
     };
     this.audit.write({ type: 'workspace.command.finished', chatId, label, code: result.code });
+    if (/test|verify|profile command|apk/i.test(label)) {
+      session.latestVerifyResult = session.lastWorkspaceCommand;
+    }
+    this.persist(chatId, session);
     this.notifier(chatId, `${result.code === 0 ? '✅' : '❌'} ${label} exit ${result.code}\n${result.output}`, verifyResultKeyboard());
   }
 
@@ -698,6 +881,7 @@ class SessionManager {
         code: event.result.code,
         output: event.result.output,
       };
+      session.latestVerifyResult = session.lastWorkspaceCommand;
       this.persist(job.chatId, session);
       this.audit.write({ type: 'verify.finished', chatId: job.chatId, label: job.label, code: event.result.code });
       this.notifier(job.chatId, `${event.result.code === 0 ? '✅' : '❌'} ${job.label} exit ${event.result.code}\n${event.result.output}`, verifyResultKeyboard());
@@ -820,6 +1004,81 @@ function taskActionsKeyboard() {
       ],
     },
   };
+}
+
+
+function commitConfirmKeyboard() {
+  return {
+    reply_markup: {
+      inline_keyboard: [[
+        { text: 'Confirm commit', callback_data: 'commit:confirm' },
+        { text: 'Cancel', callback_data: 'commit:cancel' },
+      ]],
+    },
+  };
+}
+
+function planActionsKeyboard() {
+  return {
+    reply_markup: {
+      inline_keyboard: [[
+        { text: 'Approve & Run', callback_data: 'plan:approve' },
+        { text: 'Revise Plan', callback_data: 'plan:revise' },
+        { text: 'Cancel', callback_data: 'plan:cancel' },
+      ]],
+    },
+  };
+}
+
+function summaryKeyboard() {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: 'Review diff', callback_data: 'review' }, { text: 'Test', callback_data: 'test' }],
+        [{ text: 'Commit?', callback_data: 'status' }, { text: 'PR ready', callback_data: 'pr-ready' }],
+      ],
+    },
+  };
+}
+
+function summarizeLine(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim().slice(0, 240) || '(none)';
+}
+
+function resolveProfileCommand(profile, names) {
+  const commands = profile && profile.commands ? profile.commands : {};
+  for (const name of names) {
+    if (commands[name]) {
+      return commands[name];
+    }
+  }
+  return '';
+}
+
+function resolveProfileCwd(workspace, profile) {
+  const fs = require('fs');
+  const path = require('path');
+  if (!profile || !profile.cwd || profile.cwd === '.') {
+    return workspace;
+  }
+  if (path.isAbsolute(profile.cwd)) {
+    throw new Error('Profile cwd must be workspace-relative');
+  }
+  const root = fs.realpathSync(workspace);
+  const resolved = path.resolve(root, profile.cwd);
+  const lexicalRelative = path.relative(root, resolved);
+  if (lexicalRelative.startsWith('..') || path.isAbsolute(lexicalRelative)) {
+    throw new Error('Profile cwd escapes workspace');
+  }
+  if (!fs.existsSync(resolved)) {
+    return resolved;
+  }
+  const realResolved = fs.realpathSync(resolved);
+  const realRelative = path.relative(root, realResolved);
+  if (realRelative.startsWith('..') || path.isAbsolute(realRelative)) {
+    throw new Error('Profile cwd escapes workspace');
+  }
+  return realResolved;
 }
 
 function queueKeyboard() {

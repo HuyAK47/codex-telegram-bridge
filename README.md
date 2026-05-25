@@ -15,7 +15,7 @@ This bot turns Telegram into a mobile coding assistant for your local/remote rep
 - Codex runs with `--sandbox read-only` or `--sandbox workspace-write`, never danger-full-access.
 - Codex git/trusted-directory checks stay enabled unless `CODEX_SKIP_GIT_REPO_CHECK=true` is set.
 - Telegram bot tokens and secret-looking values are redacted from outbound messages/logs.
-- Messages are capped, control characters are blocked, and attachments are ignored in this MVP.
+- Messages are capped, control characters are blocked, and Telegram images are stored only under `ATTACHMENT_DIR` before being passed to Codex.
 - Environment passed to Codex is minimal and does not include the Telegram bot token.
 - Codex command events are hidden by default; set `CODEX_SHOW_COMMAND_EVENTS=true` for debugging.
 
@@ -127,8 +127,14 @@ npm run setup-telegram
 - `/diff` shows `git diff --stat`.
 - `/files` shows changed files with `git status --short`.
 - `/test` queues the default background verify command for the current repo.
-- Repo profiles can override test/default prompts with `REPO_PROFILES_JSON`.
-- `/commit <message>` requests a git commit after write-mode confirmation.
+- Repo profiles can set `cwd`, `notesPath`, default prompts, test commands, and named command buttons with `REPO_PROFILES_JSON`.
+- `/review` asks Codex to inspect the current git diff without modifying files.
+- `/summary` or `/done` sends a compact handoff: changes, changed files, latest verify, risks, and commit readiness.
+- `/plan <task>` asks Codex for a no-write implementation plan and then shows `Approve & Run`, `Revise Plan`, and `Cancel`.
+- `/note <text>` appends repo memory to `.codex-telegram/context.md` (or profile `notesPath`) and prepends it to later Codex prompts.
+- `/branch <name>` creates a git branch after confirmed write mode; unsafe branch names are rejected.
+- `/pr-ready` asks Codex to draft a local-first PR/handoff summary from diff stat, changed files, recent commits, and latest verify output.
+- `/commit <message>` requests a git commit after write-mode confirmation and inline confirm/cancel buttons.
 - `/verbose on|off` shows or hides Codex shell command events.
 - `/reset-task` clears the current chat session state.
 - `/continue` continues the previous prompt.
@@ -138,7 +144,7 @@ npm run setup-telegram
 - `/logs` shows recent redacted audit lines.
 - `/cleanup` removes old Telegram attachment files.
 - `/run <name>` queues a named background verify command such as `Analyze` or `Flutter Test`.
-- `/codex-last` sends the last `/test` or `/run` output back into Codex as the next task.
+- `/codex-last`, `/codex_last`, `/fix-last`, or `/fix_last` sends the last `/test` or `/run` output back into Codex as the next task.
 - `/ask <prompt>` starts one non-interactive Codex run.
 - Any normal chat message also starts a Codex run, so `/ask` is optional after setup.
 - `/status` shows workspace, mode, and running state.
@@ -177,12 +183,12 @@ Then explicitly switch a chat session with `/mode write`.
 - When auto loop is on, code-changing prompts can trigger `Codex -> verify runner -> Codex retry` without manual `/codex-last`.
 - Set `CODEX_RESUME_LAST=true` to try `codex exec resume --last` for a more persistent conversation.
 - Set `DASHBOARD_PORT` to expose a tiny local dashboard with `/health` and `/sessions`.
-- Send a Telegram image, then send a prompt; the image is passed to Codex with `--image` when `ATTACHMENT_DIR` is configured.
-- After a successful task, the bot shows action buttons for `Continue`, `Work 30m`, `Diff`, `Files`, `Test`, and `Status`.
+- Send a Telegram image with text to pass both directly to Codex, or send an image by itself to get quick actions: `Review UI`, `Find bug`, `Implement similar screen`, or `Attach only`.
+- After a successful task, the bot shows action buttons for `Continue`, `Work 30m`, `Diff`, `Files`, `Test`, and `Status`; the main keyboard also exposes review, summary, PR-ready, and active repo profile commands.
 - `TEST_COMMANDS` maps repo aliases to commands, for example `chess=flutter test,*=npm test`.
 - Keep heavy verification commands such as Flutter, Gradle, Maven, Docker, and Fastlane in `/test` or `/run` profiles. They run directly from the bridge process instead of through Codex command sandboxing.
-- After `/test` or `/run` finishes, tap `Send output to Codex` or use `/codex-last` to ask Codex to inspect the latest verify output and make the next code fix.
-- `VERIFY_PROFILES_JSON` lets one repo alias point at a deeper module path like `mobile/` or `backend/` instead of always running from repo root.
+- After `/test` or `/run` finishes, tap `Fix last output` or use `/fix-last`/`/fix_last`/`/codex-last`/`/codex_last` to ask Codex to inspect the latest verify output and make the next code fix.
+- `VERIFY_PROFILES_JSON` lets one repo alias point at a deeper module path like `mobile/` or `backend/` instead of always running from repo root. `REPO_PROFILES_JSON.cwd` is also used by profile commands and `/apk` when no verify-specific cwd is set.
 - `AUTO_LOOP_DEFAULT=true` can make the bot behave like a chat-only agent: user sends one request, the bot edits code, runs verify, and retries until success or the retry cap.
 - `AUDIT_LOG_PATH` enables JSONL logs for repo selection, mode changes, prompts, and command events.
 - `SESSION_STATE_PATH` remembers the last repo/verbose setting per chat, always restoring read-only mode.
@@ -194,7 +200,7 @@ Then explicitly switch a chat session with `/mode write`.
 - `HEARTBEAT_MS=60000` sends periodic `Still running...` messages during long tasks. Use `0` to disable.
 - `CODEX_RESUME_LAST=true` switches Codex calls to `codex exec resume --last --json`.
 - The bot stores Codex `thread_id` per chat when available and resumes that exact thread for follow-up prompts. This makes short replies like “làm 1,2,3” more reliable than starting a fresh Codex run.
-- `REPO_PROFILES_JSON` supports per-repo defaults, for example `{"chess":{"testCommand":"flutter test","defaultPrompt":"You are working on a Flutter chess app."}}`.
+- `REPO_PROFILES_JSON` supports per-repo defaults, `cwd`, `notesPath`, and command buttons, for example `{"chess":{"cwd":"mobile","notesPath":".codex-telegram/context.md","testCommand":"flutter test","defaultPrompt":"You are working on a Flutter chess app.","commands":{"Analyze":"flutter analyze","Test":"flutter test","Build APK":"flutter build apk --split-per-abi"}}}`.
 - `VERIFY_PROFILES_JSON` supports background verify jobs with explicit working directories, for example `{"chess":{"cwd":"mobile","command":"flutter test"},"backend":{"cwd":"backend","command":"./gradlew --no-daemon test"}}`.
 - `VERIFY_RUNNER_MODE=local-shell` keeps verify execution in the bot host shell instead of Codex sandbox.
 - `MAX_AUTO_LOOP_ATTEMPTS=3` limits automatic fix/verify retries.
@@ -214,6 +220,7 @@ Then explicitly switch a chat session with `/mode write`.
 ## Context And Follow-Ups
 
 - Keep `CODEX_RESUME_LAST=true` for normal use. The bridge first tries to resume the stored Codex `thread_id` for the current Telegram chat.
+- Use `/plan <task>` when you want Codex to inspect first and wait for approval before editing. `Approve & Run` reruns the saved task through the normal write-safety flow.
 - Use `/continue` or the `Continue` button after a task when you want Codex to continue the previous work without restating everything.
 - If a follow-up is ambiguous, include the subject explicitly, for example `làm bước 1,2,3 trong danh sách Sprint 2 ở câu trả lời trước` instead of only `làm 1,2,3`.
 - If context feels wrong, use `/status` to confirm the current repo, then `/reset-task` to clear the chat session state and start fresh.

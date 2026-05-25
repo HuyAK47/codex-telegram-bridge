@@ -18,6 +18,28 @@ function buildTestCommand(workspace, testCommand) {
   return { command: '/bin/bash', args: ['-lc', testCommand], cwd: workspace };
 }
 
+function buildBranchCommand(workspace, branchName) {
+  const safeName = String(branchName || '').trim();
+  if (!safeName) {
+    throw new Error('Branch name is required');
+  }
+  if (safeName.startsWith('-') || safeName.includes('..') || /[\s~^:?*[\]\\]/.test(safeName)) {
+    throw new Error('Invalid branch name');
+  }
+  if (!/^[A-Za-z0-9._\/-]+$/.test(safeName) || safeName.endsWith('/') || safeName.endsWith('.')) {
+    throw new Error('Invalid branch name');
+  }
+  return { command: 'git', args: ['-C', workspace, 'checkout', '-b', safeName] };
+}
+
+function buildPrReadyCommand(workspace) {
+  return {
+    command: '/bin/bash',
+    args: ['-lc', "printf '%s\n' '--- diff stat ---'; git diff --stat; printf '%s\n' ''; printf '%s\n' '--- changed files ---'; git status --short; printf '%s\n' ''; printf '%s\n' '--- recent commits ---'; git log --oneline -5"],
+    cwd: workspace,
+  };
+}
+
 function buildCommitCommand(workspace, message) {
   if (!message || !message.trim()) {
     throw new Error('Commit message is required');
@@ -59,9 +81,11 @@ function runWorkspaceCommand(spec, timeoutMs) {
 }
 
 module.exports = {
+  buildBranchCommand,
   buildCommitCommand,
   buildDiffCommand,
   buildFilesCommand,
+  buildPrReadyCommand,
   buildTestCommand,
   runWorkspaceCommand,
 };

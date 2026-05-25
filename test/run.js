@@ -2,6 +2,9 @@ const assert = require('assert').strict;
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { EventEmitter } = require('events');
+const { spawnSync } = require('child_process');
+const { Writable } = require('stream');
 
 const {
   buildSafeEnv,
@@ -26,12 +29,16 @@ const { pickLargestPhoto, safeAttachmentPath } = require('../src/attachments');
 const { buildHealthReport } = require('../src/health');
 const { cleanupAttachments } = require('../src/cleanup');
 const { buildBotCommands } = require('../src/bot-commands');
+const { TelegramClient } = require('../src/telegram');
+const { readRepoNotes } = require('../src/repo-notes');
 const { AuditLogger } = require('../src/audit');
 const {
   buildDiffCommand,
   buildFilesCommand,
   buildTestCommand,
+  buildBranchCommand,
   buildCommitCommand,
+  buildPrReadyCommand,
 } = require('../src/workspace-tools');
 
 const tests = [];
@@ -128,6 +135,55 @@ test('Codex event helpers extract thread and assistant context', () => {
     { assistantText: 'done' }
   );
   assert.deepEqual(buildCodexArgs({ resumeSessionId: 'abc', imagePaths: [], extraArgs: [] }), ['exec', 'resume', '--json', 'abc', '-']);
+});
+
+
+test('TelegramClient sendDocument builds a valid multipart request', async () => {
+  const https = require('https');
+  const originalRequest = https.request;
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-upload-'));
+  const uploadPath = path.join(tempRoot, 'app.apk');
+  fs.writeFileSync(uploadPath, 'APKDATA');
+  const writes = [];
+  let capturedOptions = null;
+
+  https.request = (url, options, callback) => {
+    capturedOptions = options;
+    const req = new Writable({
+      write(chunk, _encoding, done) {
+        writes.push(Buffer.from(chunk));
+        done();
+      }
+    });
+    req.end = (chunk) => {
+      if (chunk) {
+        writes.push(Buffer.from(chunk));
+      }
+      const res = new EventEmitter();
+      res.setEncoding = () => {};
+      callback(res);
+      process.nextTick(() => {
+        res.emit('data', '{"ok":true,"result":{"document_id":"doc"}}');
+        res.emit('end');
+      });
+    };
+    return req;
+  };
+
+  try {
+    const result = await new TelegramClient('token').sendDocument(123, uploadPath, { caption: 'Build APK' });
+    const body = Buffer.concat(writes).toString('utf8');
+
+    assert.equal(result.document_id, 'doc');
+    assert.match(capturedOptions.headers['Content-Type'], /^multipart\/form-data; boundary=/);
+    assert.match(body, /name="chat_id"\r\n\r\n123/);
+    assert.match(body, /name="caption"\r\n\r\nBuild APK/);
+    assert.match(body, /name="document"; filename="app.apk"/);
+    assert.match(body, /Content-Type: application\/octet-stream\r\n\r\nAPKDATA\r\n--/);
+    assert.match(body, /--\r\n$/);
+  } finally {
+    https.request = originalRequest;
+  }
 });
 
 test('formatCodexJsonLine summarizes command execution events', () => {
@@ -368,7 +424,13 @@ test('workspace tool command builders are fixed and safe', () => {
     command: 'git',
     args: ['-C', '/repo', 'commit', '-m', 'safe message'],
   });
+  assert.deepEqual(buildBranchCommand('/repo', 'feature/mobile-flow'), {
+    command: 'git',
+    args: ['-C', '/repo', 'checkout', '-b', 'feature/mobile-flow'],
+  });
+  assert.equal(buildPrReadyCommand('/repo').cwd, '/repo');
   assert.throws(() => buildCommitCommand('/repo', 'bad\nmessage'), /single line/);
+  assert.throws(() => buildBranchCommand('/repo', '../bad'), /Invalid branch name/);
 });
 
 test('SessionManager write mode requires server and repo policy approval', () => {
@@ -417,13 +479,15 @@ test('SessionManager commit requires write mode and pending confirmation', async
     ALLOW_WRITE_MODE: 'true',
     WRITE_REPO_ALIASES: 'allowed',
   });
-  const manager = new SessionManager(config, (chatId, text) => notices.push({ chatId, text }));
+  const manager = new SessionManager(config, (chatId, text, options) => notices.push({ chatId, text, options }));
 
   manager.setWorkspace(1, 'allowed');
   assert.rejects(() => manager.requestCommit(1, 'safe message'), /requires confirmed write mode/);
   manager.confirmWriteMode(1);
   await manager.requestCommit(1, 'safe message');
   assert.match(notices[0].text, /Confirm commit/);
+  assert.equal(notices[0].options.reply_markup.inline_keyboard[0][0].callback_data, 'commit:confirm');
+  assert.equal(notices[0].options.reply_markup.inline_keyboard[0][1].callback_data, 'commit:cancel');
 });
 
 test('SessionManager apk requires confirmed write mode', async () => {
@@ -930,7 +994,7 @@ test('bot commands include main mobile commands', () => {
   assert.equal(names.includes('health'), true);
   assert.equal(names.includes('logs'), true);
   assert.equal(names.includes('queue'), true);
-  assert.equal(names.includes('codex-last'), true);
+  assert.equal(names.includes('codex_last'), true);
   assert.equal(names.includes('autoloop'), true);
 });
 
@@ -1012,6 +1076,254 @@ test('command handler supports sending last verify output to Codex', async () =>
     { method: 'last-output', chatId: 456 },
     { method: 'last-output', chatId: 456 },
   ]);
+});
+
+
+test('command handler routes review summary plan fix-last branch and pr-ready', async () => {
+  const calls = [];
+  const handler = createCommandHandler(
+    { allowedUserIds: new Set([123]), maxPromptChars: 20000, allowWriteMode: true },
+    {
+      review(chatId) { calls.push(['review', chatId]); },
+      async summary(chatId) { calls.push(['summary', chatId]); },
+      plan(chatId, task) { calls.push(['plan', chatId, task]); },
+      submitLastCommandOutputToCodex(chatId) { calls.push(['fix-last', chatId]); },
+      async branch(chatId, name) { calls.push(['branch', chatId, name]); },
+      async prReady(chatId) { calls.push(['pr-ready', chatId]); },
+    },
+    async () => {},
+    async () => {}
+  );
+
+  await handler({ message: { from: { id: 123 }, chat: { id: 456 }, text: '/review' } });
+  await handler({ message: { from: { id: 123 }, chat: { id: 456 }, text: '/summary' } });
+  await handler({ message: { from: { id: 123 }, chat: { id: 456 }, text: '/plan fix bug' } });
+  await handler({ message: { from: { id: 123 }, chat: { id: 456 }, text: '/fix-last' } });
+  await handler({ message: { from: { id: 123 }, chat: { id: 456 }, text: '/branch feature/x' } });
+  await handler({ message: { from: { id: 123 }, chat: { id: 456 }, text: '/pr-ready' } });
+
+  assert.deepEqual(calls, [
+    ['review', 456],
+    ['summary', 456],
+    ['plan', 456, 'fix bug'],
+    ['fix-last', 456],
+    ['branch', 456, 'feature/x'],
+    ['pr-ready', 456],
+  ]);
+});
+
+test('SessionManager stores repo notes and prepends them to prompts', () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-notes-'));
+  const prompts = [];
+  const config = loadConfig({
+    TELEGRAM_BOT_TOKEN: 'token',
+    TELEGRAM_ALLOWED_USER_IDS: '123',
+    WORKSPACE_ALLOWLIST: tempRoot,
+    REPO_ALIASES: `app=${tempRoot}`,
+    REPO_PROFILES_JSON: '{"app":{"notesPath":".codex-telegram/context.md"}}',
+  });
+  const manager = new SessionManager(config, () => {});
+  manager.setWorkspace(1, 'app');
+  manager.addNote(1, 'app này dùng Riverpod');
+  manager.ask = (chatId, prompt) => prompts.push({ chatId, prompt: manager.applyPromptContext(manager.ensure(chatId), prompt) });
+
+  manager.submitPrompt(1, 'review architecture');
+
+  assert.match(readRepoNotes(manager.ensure(1), { notesPath: '.codex-telegram/context.md' }), /Riverpod/);
+  assert.match(prompts[0].prompt, /Repo memory notes/);
+  assert.match(prompts[0].prompt, /Riverpod/);
+});
+
+test('SessionManager plan approval stores pending state and reruns task', () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-plan-'));
+  const prompts = [];
+  const config = loadConfig({
+    TELEGRAM_BOT_TOKEN: 'token',
+    TELEGRAM_ALLOWED_USER_IDS: '123',
+    WORKSPACE_ALLOWLIST: tempRoot,
+    REPO_ALIASES: `app=${tempRoot}`,
+  });
+  const manager = new SessionManager(config, () => {});
+  manager.ask = (chatId, prompt, options) => prompts.push({ chatId, prompt, options });
+  manager.setWorkspace(1, 'app');
+
+  manager.plan(1, 'implement login');
+  assert.equal(manager.status(1).pendingPlan, true);
+  assert.equal(prompts[0].options.sandboxMode, 'read-only');
+  manager.approvePlan(1);
+
+  assert.equal(manager.status(1).pendingPlan, false);
+  assert.equal(prompts[1].prompt, 'implement login');
+});
+
+test('SessionManager review and pr-ready use read-only Codex prompts', async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-pr-ready-'));
+  const prompts = [];
+  const config = loadConfig({
+    TELEGRAM_BOT_TOKEN: 'token',
+    TELEGRAM_ALLOWED_USER_IDS: '123',
+    WORKSPACE_ALLOWLIST: tempRoot,
+    REPO_ALIASES: `app=${tempRoot}`,
+  });
+  const manager = new SessionManager(config, () => {}, {
+    runWorkspaceCommand: async () => ({ code: 0, output: 'M src/app.js\nabc123 last commit' }),
+  });
+  manager.ask = (chatId, prompt, options) => prompts.push({ chatId, prompt, options });
+  manager.setWorkspace(1, 'app');
+
+  manager.review(1);
+  await manager.prReady(1);
+
+  assert.equal(prompts[0].options.sandboxMode, 'read-only');
+  assert.match(prompts[0].prompt, /Review the current git diff/);
+  assert.equal(prompts[1].options.sandboxMode, 'read-only');
+  assert.match(prompts[1].prompt, /ready-for-PR summary/);
+});
+
+test('command handler prompts for image-only intent and passes text-plus-image through', async () => {
+  const calls = [];
+  const sends = [];
+  const handler = createCommandHandler(
+    { allowedUserIds: new Set([123]), maxPromptChars: 20000 },
+    { submitPrompt(chatId, prompt) { calls.push({ chatId, prompt }); } },
+    async (chatId, text, options) => sends.push({ chatId, text, options }),
+    async () => {},
+    async () => '/tmp/image.jpg'
+  );
+
+  await handler({ message: { from: { id: 123 }, chat: { id: 456 }, photo: [{ file_id: 'p1', width: 1, height: 1 }] } });
+  await handler({ message: { from: { id: 123 }, chat: { id: 456 }, text: 'make this screen', photo: [{ file_id: 'p2', width: 1, height: 1 }] } });
+  await handler({ callback_query: { id: 'cb1', from: { id: 123 }, message: { chat: { id: 456 } }, data: 'image-intent:review-ui' } });
+
+  assert.match(sends[0].text, /What should Codex do/);
+  assert.equal(sends[0].options.reply_markup.inline_keyboard[0][0].callback_data, 'image-intent:review-ui');
+  assert.equal(calls[0].prompt, 'make this screen');
+  assert.match(calls[1].prompt, /Review the attached UI screenshot/);
+});
+
+test('main keyboard prefers active repo profile commands', () => {
+  const keyboard = require('../src/commands').mainKeyboard(
+    { allowWriteMode: true, repoProfiles: new Map([
+      ['app', { commands: { Analyze: 'flutter analyze', Test: 'flutter test' } }],
+      ['api', { commands: { Compile: './gradlew compileJava' } }],
+    ]) },
+    { status() { return { repoAlias: 'app' }; } },
+    1
+  );
+  const flattened = [].concat.apply([], keyboard.reply_markup.inline_keyboard).map((button) => button.text);
+
+  assert.equal(flattened.includes('Analyze'), true);
+  assert.equal(flattened.includes('Compile'), false);
+});
+
+
+test('pr-ready workspace command shell headings do not trip printf option parsing', () => {
+  const spec = buildPrReadyCommand(process.cwd());
+  const result = spawnSync(spec.command, spec.args, { cwd: spec.cwd, encoding: 'utf8' });
+
+  assert.equal(result.status, 0);
+  assert.match(result.stdout, /--- diff stat ---/);
+  assert.equal(result.stderr.includes('printf: --'), false);
+});
+
+test('repo notes reject symlink escapes before writing', () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-notes-escape-'));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-notes-outside-'));
+  fs.symlinkSync(outside, path.join(tempRoot, '.codex-telegram'));
+  const config = loadConfig({
+    TELEGRAM_BOT_TOKEN: 'token',
+    TELEGRAM_ALLOWED_USER_IDS: '123',
+    WORKSPACE_ALLOWLIST: tempRoot,
+    REPO_ALIASES: `app=${tempRoot}`,
+  });
+  const manager = new SessionManager(config, () => {});
+  manager.setWorkspace(1, 'app');
+
+  assert.throws(() => manager.addNote(1, 'do not escape'), /notesPath escapes workspace/);
+  assert.equal(fs.existsSync(path.join(outside, 'context.md')), false);
+});
+
+test('profile cwd rejects symlink escapes for verify and profile commands', async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-cwd-escape-'));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-cwd-outside-'));
+  fs.symlinkSync(outside, path.join(tempRoot, 'mobile'));
+  const config = loadConfig({
+    TELEGRAM_BOT_TOKEN: 'token',
+    TELEGRAM_ALLOWED_USER_IDS: '123',
+    WORKSPACE_ALLOWLIST: tempRoot,
+    REPO_ALIASES: `app=${tempRoot}`,
+    REPO_PROFILES_JSON: '{"app":{"cwd":"mobile","testCommand":"npm test","commands":{"Analyze":"npm test"}}}',
+  });
+  const manager = new SessionManager(config, () => {}, {
+    runWorkspaceCommand: async () => ({ code: 0, output: 'should not run' }),
+  });
+  manager.setWorkspace(1, 'app');
+
+  assert.throws(() => resolveVerifyProfile(config, manager.ensure(1)), /Profile cwd escapes workspace/);
+  await assert.rejects(() => manager.runProfileCommand(1, 'Analyze'), /Profile cwd escapes workspace/);
+});
+
+test('non-plan Codex runs do not overwrite pending plan actions', () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-plan-state-'));
+  const notices = [];
+  let child;
+  const config = loadConfig({
+    TELEGRAM_BOT_TOKEN: 'token',
+    TELEGRAM_ALLOWED_USER_IDS: '123',
+    WORKSPACE_ALLOWLIST: tempRoot,
+    REPO_ALIASES: `app=${tempRoot}`,
+    HEARTBEAT_MS: '0',
+  });
+  const manager = new SessionManager(config, (chatId, text, options) => notices.push({ chatId, text, options }), {
+    runCodexOnce: () => {
+      child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.stdin = { write() {}, end() {} };
+      child.kill = () => {};
+      return child;
+    },
+  });
+  manager.setWorkspace(1, 'app');
+  const session = manager.ensure(1);
+  session.pendingPlanPrompt = 'original task';
+  session.lastAssistantText = 'previous plan';
+
+  manager.ask(1, 'Review the current diff', { sandboxMode: 'read-only', auditType: 'review.started' });
+  child.emit('close', 0, null);
+
+  assert.equal(notices.some((notice) => notice.text === 'Plan actions:'), false);
+  assert.equal(session.pendingPlanText, '');
+});
+
+test('attached images are consumed by exactly one Codex prompt', () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-image-once-'));
+  const runs = [];
+  const config = loadConfig({
+    TELEGRAM_BOT_TOKEN: 'token',
+    TELEGRAM_ALLOWED_USER_IDS: '123',
+    WORKSPACE_ALLOWLIST: tempRoot,
+    REPO_ALIASES: `app=${tempRoot}`,
+    HEARTBEAT_MS: '0',
+  });
+  const manager = new SessionManager(config, () => {}, {
+    runCodexOnce: (options) => {
+      runs.push(options);
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.stdin = { write() {}, end() {} };
+      child.kill = () => {};
+      return child;
+    },
+  });
+  manager.setWorkspace(1, 'app');
+  manager.attachImages(1, ['/tmp/one.png']);
+
+  manager.ask(1, 'describe image');
+
+  assert.deepEqual(runs[0].imagePaths, ['/tmp/one.png']);
+  assert.deepEqual(manager.ensure(1).pendingImagePaths, []);
 });
 
 let failures = 0;

@@ -26,17 +26,20 @@ function createCommandHandler(config, sessionManager, send, answerCallback, atta
     }
 
     const chatId = message.chat.id;
-    if (!message.text && message.photo && message.photo.length > 0) {
+    const rawText = message.text || message.caption || '';
+    if (message.photo && message.photo.length > 0) {
       if (!attachmentHandler) {
         await send(chatId, 'Image received, but attachment handling is not enabled.');
         return;
       }
       const attachmentPath = await attachmentHandler(message, chatId);
-      await send(chatId, `✅ Image attached for the next prompt:\n${attachmentPath}`);
-      return;
+      if (!rawText) {
+        await send(chatId, `✅ Image attached. What should Codex do?\n${attachmentPath}`, imageIntentKeyboard());
+        return;
+      }
     }
 
-    const text = validateTelegramText(message.text || '', config.maxPromptChars);
+    const text = validateTelegramText(rawText, config.maxPromptChars);
     if (!text) {
       await send(chatId, 'Send text only. Files/images are intentionally disabled in this MVP.');
       return;
@@ -71,7 +74,7 @@ function createCommandHandler(config, sessionManager, send, answerCallback, atta
       await send(
         chatId,
         statusText(status),
-        mainKeyboard(config)
+        mainKeyboard(config, sessionManager, chatId)
       );
       return;
     }
@@ -130,7 +133,7 @@ function createCommandHandler(config, sessionManager, send, answerCallback, atta
     }
 
     if (text === '/health') {
-      await send(chatId, buildHealthReport(config), mainKeyboard(config));
+      await send(chatId, buildHealthReport(config), mainKeyboard(config, sessionManager, chatId));
       return;
     }
 
@@ -178,8 +181,38 @@ function createCommandHandler(config, sessionManager, send, answerCallback, atta
       return;
     }
 
-    if (text === '/codex-last') {
+    if (text === '/codex-last' || text === '/codex_last' || text === '/fix-last' || text === '/fix_last') {
       sessionManager.submitLastCommandOutputToCodex(chatId);
+      return;
+    }
+
+    if (text.startsWith('/plan ')) {
+      sessionManager.plan(chatId, text.slice('/plan '.length));
+      return;
+    }
+
+    if (text === '/review') {
+      sessionManager.review(chatId);
+      return;
+    }
+
+    if (text === '/summary' || text === '/done') {
+      await sessionManager.summary(chatId);
+      return;
+    }
+
+    if (text.startsWith('/note ')) {
+      sessionManager.addNote(chatId, text.slice('/note '.length));
+      return;
+    }
+
+    if (text.startsWith('/branch ')) {
+      await sessionManager.branch(chatId, text.slice('/branch '.length));
+      return;
+    }
+
+    if (text === '/pr-ready' || text === '/pr_ready') {
+      await sessionManager.prReady(chatId);
       return;
     }
 
@@ -244,7 +277,7 @@ async function handleCallback(callbackQuery, config, sessionManager, send, answe
     return;
   }
   if (data === 'status') {
-    await send(chatId, statusText(sessionManager.status(chatId)), mainKeyboard(config));
+    await send(chatId, statusText(sessionManager.status(chatId)), mainKeyboard(config, sessionManager, chatId));
     return;
   }
   if (data === 'stop') {
@@ -305,7 +338,7 @@ async function handleCallback(callbackQuery, config, sessionManager, send, answe
     return;
   }
   if (data === 'health') {
-    await send(chatId, buildHealthReport(config), mainKeyboard(config));
+    await send(chatId, buildHealthReport(config), mainKeyboard(config, sessionManager, chatId));
     return;
   }
   if (data.startsWith('run:')) {
@@ -314,6 +347,40 @@ async function handleCallback(callbackQuery, config, sessionManager, send, answe
     } else {
       await sessionManager.runProfileCommand(chatId, data.slice('run:'.length));
     }
+    return;
+  }
+  if (data === 'review') {
+    sessionManager.review(chatId);
+    return;
+  }
+  if (data === 'summary' || data === 'done') {
+    await sessionManager.summary(chatId);
+    return;
+  }
+  if (data === 'pr-ready') {
+    await sessionManager.prReady(chatId);
+    return;
+  }
+  if (data === 'plan:approve') {
+    sessionManager.approvePlan(chatId);
+    return;
+  }
+  if (data === 'plan:revise') {
+    sessionManager.revisePlan(chatId);
+    return;
+  }
+  if (data === 'plan:cancel') {
+    sessionManager.cancelPlan(chatId);
+    await send(chatId, 'Plan cancelled.');
+    return;
+  }
+  if (data.startsWith('image-intent:')) {
+    const intent = data.slice('image-intent:'.length);
+    if (intent === 'attach-only') {
+      await send(chatId, 'Image kept for the next prompt.');
+      return;
+    }
+    submitPrompt(sessionManager, chatId, imageIntentPrompt(intent));
     return;
   }
   if (data === 'diff') {
@@ -336,7 +403,7 @@ async function handleCallback(callbackQuery, config, sessionManager, send, answe
     await sessionManager.apk(chatId);
     return;
   }
-  if (data === 'codex:last-output') {
+  if (data === 'codex:last-output' || data === 'fix:last') {
     sessionManager.submitLastCommandOutputToCodex(chatId);
     return;
   }
@@ -406,7 +473,13 @@ function helpText(config) {
     '/logs - show recent audit lines',
     '/cleanup - remove old attachment files',
     '/run <name> - run a repo profile command',
-    '/codex-last - send the last verify output back to Codex',
+    '/review - ask Codex to review the current diff without edits',
+    '/summary or /done - compact handoff summary',
+    '/plan <task> - no-write plan with approve/revise/cancel buttons',
+    '/note <text> - save repo-scoped memory in .codex-telegram/context.md',
+    '/branch <name> - create a git branch after write confirmation',
+    '/pr-ready - draft a PR-ready summary from local state',
+    '/codex-last, /codex_last, /fix-last, or /fix_last - send the last verify output back to Codex',
     '/ask <prompt> - run Codex once',
     'normal text - same as /ask <prompt>',
     '/status - show current session',
@@ -450,15 +523,21 @@ function statusText(status) {
   return [
     `workspace: ${status.workspace || '(not selected)'}`,
     `mode: ${status.mode}`,
+    `workflow: ${status.workflowState || (status.running ? 'coding' : 'idle')}`,
     `running: ${status.running ? 'yes' : 'no'}`,
     `verify: ${status.verifyRunning ? status.verifyLabel : 'idle'}`,
+    `last command: ${status.lastCommandLabel || '(none)'}`,
+    `pending commit: ${status.pendingCommit ? 'yes' : 'no'}`,
+    `pending plan: ${status.pendingPlan ? 'yes' : 'no'}`,
+    `repo notes: ${status.repoNotes && status.repoNotes.hasNotes ? 'yes' : 'no'}`,
     `autoloop: ${status.autoLoopEnabled ? 'on' : 'off'}`,
     `verbose: ${status.verbose ? 'yes' : 'no'}`,
   ].join('\n');
 }
 
-function mainKeyboard(config) {
-  const profileButtons = profileCommandButtons(config);
+function mainKeyboard(config, sessionManager, chatId) {
+  const status = sessionManager && sessionManager.status && chatId !== undefined ? sessionManager.status(chatId) : null;
+  const profileButtons = profileCommandButtons(config, status && status.repoAlias);
   const writeButton = config.allowWriteMode
     ? { text: '⚠️ Write', callback_data: 'mode:write' }
     : { text: '🔒 Write disabled', callback_data: 'mode:write' };
@@ -469,7 +548,8 @@ function mainKeyboard(config) {
         [{ text: 'Read', callback_data: 'mode:read' }, writeButton],
         [{ text: 'Auto Loop On', callback_data: 'autoloop:on' }, { text: 'Auto Loop Off', callback_data: 'autoloop:off' }],
         [{ text: 'Diff', callback_data: 'diff' }, { text: 'Files', callback_data: 'files' }, { text: 'Test', callback_data: 'test' }, { text: 'APK', callback_data: 'apk' }],
-        [{ text: 'Send last output to Codex', callback_data: 'codex:last-output' }],
+        [{ text: 'Review', callback_data: 'review' }, { text: 'Summary', callback_data: 'summary' }, { text: 'PR ready', callback_data: 'pr-ready' }],
+        [{ text: 'Fix last output', callback_data: 'fix:last' }],
         [{ text: 'Queue', callback_data: 'queue' }, { text: 'Cancel Queue', callback_data: 'cancel-queue' }, { text: 'Continue', callback_data: 'continue' }],
         [{ text: 'Health', callback_data: 'health' }],
         ...profileButtons,
@@ -498,12 +578,45 @@ function confirmWriteKeyboard() {
   };
 }
 
+function imageIntentKeyboard() {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: 'Review UI', callback_data: 'image-intent:review-ui' }, { text: 'Find bug', callback_data: 'image-intent:find-bug' }],
+        [{ text: 'Implement similar screen', callback_data: 'image-intent:similar-screen' }, { text: 'Attach only', callback_data: 'image-intent:attach-only' }],
+      ],
+    },
+  };
+}
+
+function imageIntentPrompt(intent) {
+  if (intent === 'review-ui') {
+    return 'Review the attached UI screenshot. Identify UX issues, visual bugs, accessibility risks, and concrete implementation fixes. Do not modify files unless I approve a follow-up.';
+  }
+  if (intent === 'find-bug') {
+    return 'Inspect the attached screenshot for likely app bugs. Explain probable root causes in the codebase and propose the smallest safe fix.';
+  }
+  if (intent === 'similar-screen') {
+    return 'Use the attached screenshot as a reference and implement a similar screen in this app. Keep changes minimal and match existing architecture.';
+  }
+  return 'Keep the attached image available for the next prompt. Do not run Codex yet.';
+}
+
 function queueKeyboard() {
   return { reply_markup: { inline_keyboard: [[{ text: 'Status', callback_data: 'status' }, { text: 'Cancel Queue', callback_data: 'cancel-queue' }, { text: 'Stop', callback_data: 'stop' }]] } };
 }
 
-function profileCommandButtons(config) {
+function profileCommandButtons(config, activeAlias) {
   const names = new Set();
+  if (activeAlias && config.repoProfiles && config.repoProfiles.has(activeAlias)) {
+    const activeProfile = config.repoProfiles.get(activeAlias);
+    if (activeProfile.commands && typeof activeProfile.commands === 'object') {
+      for (const name of Object.keys(activeProfile.commands)) {
+        names.add(name);
+      }
+      return Array.from(names).slice(0, 3).map((name) => [{ text: name, callback_data: `run:${name}` }]);
+    }
+  }
   if (config.repoProfiles) {
     for (const profile of config.repoProfiles.values()) {
       if (profile.commands && typeof profile.commands === 'object') {
