@@ -582,9 +582,8 @@ class SessionManager {
 
   async test(chatId) {
     const session = this.requireWorkspace(chatId);
-    const profile = getRepoProfile(this.config, session.repoAlias || '');
-    const testCommand = profile.testCommand || this.config.testCommands.get(session.repoAlias || '') || this.config.testCommands.get('*');
-    await this.runAndNotify(chatId, 'Test', buildTestCommand(session.workspace, testCommand));
+    const resolved = resolveVerifyProfile(this.config, session, 'default-test');
+    await this.runAndNotify(chatId, 'Test', buildTestCommand(resolved.cwd, resolved.command));
   }
 
   async enqueueTest(chatId) {
@@ -719,6 +718,76 @@ ${result.note}`);
     ].join('\n'), { sandboxMode: 'read-only', auditType: 'pr_ready.started', finishAuditType: 'pr_ready.finished' });
   }
 
+  async checks(chatId) {
+    const session = this.requireWorkspace(chatId);
+    const profile = getRepoProfile(this.config, session.repoAlias || '');
+    const command = profile.checksCommand || resolveProfileCommand(profile, ['Checks', 'CI Checks', 'PR Checks']);
+    this.audit.write({ type: 'checks.requested', chatId, workspace: session.workspace, configured: Boolean(command) });
+    if (!command) {
+      this.notifier(chatId, [
+        'ℹ️ Checks are not configured for this repo.',
+        'Use /test or /run <name>, or set REPO_PROFILES_JSON with checksCommand or a "Checks" profile command.',
+      ].join('\n'));
+      return null;
+    }
+    return this.enqueueVerifyJob(chatId, {
+      label: 'Checks',
+      cwd: resolveProfileCwd(session.workspace, profile),
+      command,
+      successText: '',
+      sourcePrompt: session.lastPrompt,
+    });
+  }
+
+  async rerunFailed(chatId) {
+    const session = this.requireWorkspace(chatId);
+    const profile = getRepoProfile(this.config, session.repoAlias || '');
+    const command = profile.rerunFailedCommand || resolveProfileCommand(profile, ['Rerun Failed', 'Rerun CI', 'Retry Checks']);
+    this.audit.write({ type: 'rerun_failed.requested', chatId, workspace: session.workspace, configured: Boolean(command) });
+    if (command) {
+      return this.enqueueVerifyJob(chatId, {
+        label: 'Rerun failed checks',
+        cwd: resolveProfileCwd(session.workspace, profile),
+        command,
+        successText: '',
+        sourcePrompt: session.lastPrompt,
+      });
+    }
+
+    const latest = session.latestVerifyResult || session.lastWorkspaceCommand;
+    if (latest && latest.code !== 0 && (latest.rerunCommand || latest.command)) {
+      return this.enqueueVerifyJob(chatId, {
+        label: `Rerun failed: ${latest.label}`,
+        cwd: latest.cwd || resolveProfileCwd(session.workspace, profile),
+        command: latest.rerunCommand || latest.command,
+        successText: '',
+        sourcePrompt: session.lastPrompt,
+      });
+    }
+
+    this.notifier(chatId, [
+      'ℹ️ No failed local verify command to rerun.',
+      'Run /test, /checks, or configure rerunFailedCommand in REPO_PROFILES_JSON.',
+    ].join('\n'));
+    return null;
+  }
+
+  async prCreate(chatId) {
+    const session = this.requireWorkspace(chatId);
+    const profile = getRepoProfile(this.config, session.repoAlias || '');
+    const command = profile.prCreateCommand || resolveProfileCommand(profile, ['Create PR', 'PR Create', 'Open PR']);
+    this.audit.write({ type: 'pr_create.requested', chatId, workspace: session.workspace, configured: Boolean(command) });
+    if (!command) {
+      this.notifier(chatId, [
+        'ℹ️ PR creation is not configured for this repo.',
+        'Use /pr-ready for a PR body draft, or set REPO_PROFILES_JSON with prCreateCommand or a "Create PR" profile command.',
+      ].join('\n'));
+      return null;
+    }
+    await this.runAndNotify(chatId, 'Create PR', buildTestCommand(resolveProfileCwd(session.workspace, profile), command));
+    return true;
+  }
+
   auditTail(limit) {
     return this.audit.readTail(limit || 20);
   }
@@ -800,6 +869,8 @@ ${result.note}`);
     session.lastWorkspaceCommand = {
       label,
       command: formatCommandSpec(spec),
+      rerunCommand: commandForRerun(spec),
+      cwd: spec.cwd || session.workspace,
       code: result.code,
       output: result.output,
     };
@@ -878,6 +949,8 @@ ${result.note}`);
       session.lastWorkspaceCommand = {
         label: job.label,
         command: job.command,
+        rerunCommand: job.command,
+        cwd: job.cwd,
         code: event.result.code,
         output: event.result.output,
       };
@@ -950,6 +1023,13 @@ module.exports = { SessionManager };
 
 function formatCommandSpec(spec) {
   return [spec.command].concat(spec.args || []).join(' ');
+}
+
+function commandForRerun(spec) {
+  if (spec.command === '/bin/bash' && spec.args && spec.args[0] === '-lc' && spec.args[1]) {
+    return spec.args[1];
+  }
+  return formatCommandSpec(spec);
 }
 
 function verifyResultKeyboard() {

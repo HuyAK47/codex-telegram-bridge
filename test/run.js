@@ -32,6 +32,7 @@ const { buildBotCommands } = require('../src/bot-commands');
 const { TelegramClient } = require('../src/telegram');
 const { readRepoNotes } = require('../src/repo-notes');
 const { AuditLogger } = require('../src/audit');
+const { detectTestCommand } = require('../src/test-command-detector');
 const {
   buildDiffCommand,
   buildFilesCommand,
@@ -756,6 +757,31 @@ test('parseKeyValueMap allows wildcard fallback key', () => {
   assert.equal(map.get('*'), 'npm test');
 });
 
+test('test command detector infers common repo test commands', () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-detect-test-'));
+  const nodeRepo = path.join(tempRoot, 'node');
+  const flutterRepo = path.join(tempRoot, 'flutter');
+  const goRepo = path.join(tempRoot, 'go');
+  fs.mkdirSync(nodeRepo);
+  fs.mkdirSync(flutterRepo);
+  fs.mkdirSync(goRepo);
+  fs.writeFileSync(path.join(nodeRepo, 'package.json'), JSON.stringify({ scripts: { test: 'vitest' } }));
+  fs.writeFileSync(path.join(nodeRepo, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n');
+  fs.writeFileSync(path.join(flutterRepo, 'pubspec.yaml'), 'name: app\ndependencies:\n  flutter:\n    sdk: flutter\n');
+  fs.writeFileSync(path.join(goRepo, 'go.mod'), 'module example.com/app\n');
+
+  assert.equal(detectTestCommand(nodeRepo), 'pnpm test');
+  assert.equal(detectTestCommand(flutterRepo), 'flutter test');
+  assert.equal(detectTestCommand(goRepo), 'go test ./...');
+});
+
+test('test command detector ignores npm placeholder script', () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-detect-placeholder-'));
+  fs.writeFileSync(path.join(tempRoot, 'package.json'), JSON.stringify({ scripts: { test: 'echo "Error: no test specified" && exit 1' } }));
+
+  assert.equal(detectTestCommand(tempRoot), '');
+});
+
 test('verify profiles can target a subdirectory and shell command', () => {
   const profiles = parseVerifyProfiles('{"chess-mobile":{"cwd":"mobile","command":"flutter test","successText":"green"}}');
 
@@ -784,6 +810,26 @@ test('verify profile resolver uses repo alias profile and workspace-relative cwd
   assert.equal(profile.command, 'flutter test');
   assert.equal(profile.cwd, path.join(tempRoot, 'mobile'));
   assert.equal(profile.successText, 'All green');
+});
+
+test('verify profile resolver auto-detects test command from selected repo', () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-verify-detect-'));
+  fs.writeFileSync(path.join(tempRoot, 'package.json'), JSON.stringify({ scripts: { test: 'node test/run.js' } }));
+  const config = loadConfig({
+    TELEGRAM_BOT_TOKEN: 'token',
+    TELEGRAM_ALLOWED_USER_IDS: '123',
+    WORKSPACE_ALLOWLIST: tempRoot,
+    DEFAULT_WORKSPACE: tempRoot,
+  });
+  const session = {
+    workspace: tempRoot,
+    repoAlias: '',
+  };
+
+  const profile = resolveVerifyProfile(config, session, 'default-test');
+
+  assert.equal(profile.command, 'npm test');
+  assert.equal(profile.cwd, tempRoot);
 });
 
 test('verify runner reports queued, started, and finished events', async () => {
@@ -996,6 +1042,9 @@ test('bot commands include main mobile commands', () => {
   assert.equal(names.includes('queue'), true);
   assert.equal(names.includes('codex_last'), true);
   assert.equal(names.includes('autoloop'), true);
+  assert.equal(names.includes('checks'), true);
+  assert.equal(names.includes('rerun_failed'), true);
+  assert.equal(names.includes('pr_create'), true);
 });
 
 test('audit logger can read recent redacted lines', () => {
@@ -1090,6 +1139,9 @@ test('command handler routes review summary plan fix-last branch and pr-ready', 
       submitLastCommandOutputToCodex(chatId) { calls.push(['fix-last', chatId]); },
       async branch(chatId, name) { calls.push(['branch', chatId, name]); },
       async prReady(chatId) { calls.push(['pr-ready', chatId]); },
+      async checks(chatId) { calls.push(['checks', chatId]); },
+      async rerunFailed(chatId) { calls.push(['rerun-failed', chatId]); },
+      async prCreate(chatId) { calls.push(['pr-create', chatId]); },
     },
     async () => {},
     async () => {}
@@ -1101,6 +1153,9 @@ test('command handler routes review summary plan fix-last branch and pr-ready', 
   await handler({ message: { from: { id: 123 }, chat: { id: 456 }, text: '/fix-last' } });
   await handler({ message: { from: { id: 123 }, chat: { id: 456 }, text: '/branch feature/x' } });
   await handler({ message: { from: { id: 123 }, chat: { id: 456 }, text: '/pr-ready' } });
+  await handler({ message: { from: { id: 123 }, chat: { id: 456 }, text: '/checks' } });
+  await handler({ message: { from: { id: 123 }, chat: { id: 456 }, text: '/rerun-failed' } });
+  await handler({ message: { from: { id: 123 }, chat: { id: 456 }, text: '/pr-create' } });
 
   assert.deepEqual(calls, [
     ['review', 456],
@@ -1109,7 +1164,76 @@ test('command handler routes review summary plan fix-last branch and pr-ready', 
     ['fix-last', 456],
     ['branch', 456, 'feature/x'],
     ['pr-ready', 456],
+    ['checks', 456],
+    ['rerun-failed', 456],
+    ['pr-create', 456],
   ]);
+});
+
+test('SessionManager optional CI helpers are profile-driven with local fallbacks', async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-ci-helpers-'));
+  const notices = [];
+  const jobs = [];
+  const config = loadConfig({
+    TELEGRAM_BOT_TOKEN: 'token',
+    TELEGRAM_ALLOWED_USER_IDS: '123',
+    WORKSPACE_ALLOWLIST: tempRoot,
+    REPO_ALIASES: `app=${tempRoot}`,
+    REPO_PROFILES_JSON: '{"app":{"checksCommand":"npm test","rerunFailedCommand":"npm run retry","prCreateCommand":"gh pr create --fill"}}',
+  });
+  const manager = new SessionManager(config, (chatId, text) => notices.push({ chatId, text }), {
+    runWorkspaceCommand: async () => ({ code: 0, output: 'created pr' }),
+  });
+  manager.enqueueVerifyJob = async (chatId, fields) => {
+    jobs.push({ chatId, fields });
+    return fields;
+  };
+  manager.setWorkspace(1, 'app');
+
+  await manager.checks(1);
+  await manager.rerunFailed(1);
+  await manager.prCreate(1);
+
+  assert.equal(jobs[0].fields.label, 'Checks');
+  assert.equal(jobs[0].fields.command, 'npm test');
+  assert.equal(jobs[1].fields.label, 'Rerun failed checks');
+  assert.equal(jobs[1].fields.command, 'npm run retry');
+  assert.equal(notices.some((notice) => /Create PR exit 0/.test(notice.text)), true);
+});
+
+test('SessionManager optional CI helpers explain missing configuration and rerun last failed verify', async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-ci-fallback-'));
+  const notices = [];
+  const jobs = [];
+  const config = loadConfig({
+    TELEGRAM_BOT_TOKEN: 'token',
+    TELEGRAM_ALLOWED_USER_IDS: '123',
+    WORKSPACE_ALLOWLIST: tempRoot,
+    REPO_ALIASES: `app=${tempRoot}`,
+  });
+  const manager = new SessionManager(config, (chatId, text) => notices.push({ chatId, text }));
+  manager.enqueueVerifyJob = async (chatId, fields) => {
+    jobs.push({ chatId, fields });
+    return fields;
+  };
+  manager.setWorkspace(1, 'app');
+
+  await manager.checks(1);
+  await manager.prCreate(1);
+  manager.ensure(1).lastWorkspaceCommand = {
+    label: 'Test',
+    command: '/bin/bash -lc npm test',
+    rerunCommand: 'npm test',
+    cwd: tempRoot,
+    code: 1,
+    output: 'failed',
+  };
+  await manager.rerunFailed(1);
+
+  assert.equal(notices.some((notice) => /Checks are not configured/.test(notice.text)), true);
+  assert.equal(notices.some((notice) => /PR creation is not configured/.test(notice.text)), true);
+  assert.equal(jobs[0].fields.label, 'Rerun failed: Test');
+  assert.equal(jobs[0].fields.command, 'npm test');
 });
 
 test('SessionManager stores repo notes and prepends them to prompts', () => {

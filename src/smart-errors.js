@@ -20,9 +20,9 @@ function buildSmartErrorResponse(message) {
       [[{ text: 'Enable Write', callback_data: 'mode:write' }, { text: 'Stay Read-only', callback_data: 'mode:read' }]]
     );
   }
-  if (/No test command configured/i.test(text)) {
+  if (/No test command configured|No test command configured or detected/i.test(text)) {
     return response(
-      `No test command is configured for this repo. Set TEST_COMMANDS in .env and restart.\n\n${text}`,
+      `I could not auto-detect a test command for this repo. Set TEST_COMMANDS or REPO_PROFILES_JSON in .env and restart.\n\n${text}`,
       [[{ text: 'Status', callback_data: 'status' }]]
     );
   }

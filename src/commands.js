@@ -216,6 +216,21 @@ function createCommandHandler(config, sessionManager, send, answerCallback, atta
       return;
     }
 
+    if (text === '/checks') {
+      await sessionManager.checks(chatId);
+      return;
+    }
+
+    if (text === '/rerun-failed' || text === '/rerun_failed') {
+      await sessionManager.rerunFailed(chatId);
+      return;
+    }
+
+    if (text === '/pr-create' || text === '/pr_create') {
+      await sessionManager.prCreate(chatId);
+      return;
+    }
+
     if (text.startsWith('/commit ')) {
       await sessionManager.requestCommit(chatId, text.slice('/commit '.length));
       return;
@@ -361,6 +376,18 @@ async function handleCallback(callbackQuery, config, sessionManager, send, answe
     await sessionManager.prReady(chatId);
     return;
   }
+  if (data === 'checks') {
+    await sessionManager.checks(chatId);
+    return;
+  }
+  if (data === 'rerun-failed') {
+    await sessionManager.rerunFailed(chatId);
+    return;
+  }
+  if (data === 'pr-create') {
+    await sessionManager.prCreate(chatId);
+    return;
+  }
   if (data === 'plan:approve') {
     sessionManager.approvePlan(chatId);
     return;
@@ -479,6 +506,9 @@ function helpText(config) {
     '/note <text> - save repo-scoped memory in .codex-telegram/context.md',
     '/branch <name> - create a git branch after write confirmation',
     '/pr-ready - draft a PR-ready summary from local state',
+    '/checks - run profile-driven CI/check command or explain what is missing',
+    '/rerun-failed - rerun configured failed-check command or last failed verify',
+    '/pr-create - run a configured PR creation command, otherwise use /pr-ready fallback',
     '/codex-last, /codex_last, /fix-last, or /fix_last - send the last verify output back to Codex',
     '/ask <prompt> - run Codex once',
     'normal text - same as /ask <prompt>',
@@ -549,6 +579,7 @@ function mainKeyboard(config, sessionManager, chatId) {
         [{ text: 'Auto Loop On', callback_data: 'autoloop:on' }, { text: 'Auto Loop Off', callback_data: 'autoloop:off' }],
         [{ text: 'Diff', callback_data: 'diff' }, { text: 'Files', callback_data: 'files' }, { text: 'Test', callback_data: 'test' }, { text: 'APK', callback_data: 'apk' }],
         [{ text: 'Review', callback_data: 'review' }, { text: 'Summary', callback_data: 'summary' }, { text: 'PR ready', callback_data: 'pr-ready' }],
+        [{ text: 'Checks', callback_data: 'checks' }, { text: 'Rerun failed', callback_data: 'rerun-failed' }, { text: 'Create PR', callback_data: 'pr-create' }],
         [{ text: 'Fix last output', callback_data: 'fix:last' }],
         [{ text: 'Queue', callback_data: 'queue' }, { text: 'Cancel Queue', callback_data: 'cancel-queue' }, { text: 'Continue', callback_data: 'continue' }],
         [{ text: 'Health', callback_data: 'health' }],

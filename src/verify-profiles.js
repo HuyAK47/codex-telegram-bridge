@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const { getRepoProfile } = require('./repo-profiles');
+const { detectTestCommand } = require('./test-command-detector');
 
 function parseVerifyProfiles(value) {
   const map = new Map();
@@ -37,14 +38,15 @@ function resolveVerifyProfile(config, session, requestedName) {
   }
 
   const profile = getRepoProfile(config, session.repoAlias || '');
-  const command = profile.testCommand || config.testCommands.get(session.repoAlias || '') || config.testCommands.get('*');
+  const cwd = resolveProfileCwd(session.workspace, profile);
+  const command = profile.testCommand || config.testCommands.get(session.repoAlias || '') || config.testCommands.get('*') || detectTestCommand(cwd);
   if (!command || !String(command).trim()) {
-    throw new Error('No test command configured for this repo');
+    throw new Error('No test command configured or detected for this repo');
   }
   return {
     name: session.repoAlias || name,
     label: 'Test',
-    cwd: resolveProfileCwd(session.workspace, profile),
+    cwd: cwd,
     command: command,
     successText: '',
     kind: 'shell',
