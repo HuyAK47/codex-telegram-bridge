@@ -150,7 +150,7 @@ VERIFY_PROFILES_JSON='{"chess":{"cwd":"mobile","command":"flutter test","success
 - `/status`: xem workspace, mode, workflow, queue, verify, pending plan/commit, repo notes và verbose.
 - `/health`: in health report cấu hình.
 - `/stop`: gửi `SIGTERM` cho Codex task đang chạy.
-- `/reset-task` hoặc `/reset_task`: xoá state phiên hiện tại của chat.
+- `/reset-task`, `/reset_task`, `/new`, `/clear`: xoá state phiên hiện tại và khởi tạo context mới tinh cho chat.
 
 ### Mode và task
 

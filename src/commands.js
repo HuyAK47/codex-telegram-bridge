@@ -248,9 +248,9 @@ function createCommandHandler(config, sessionManager, send, answerCallback, atta
       return;
     }
 
-    if (text === '/reset-task' || text === '/reset_task') {
+    if (text === '/reset-task' || text === '/reset_task' || text === '/new' || text === '/clear') {
       sessionManager.reset(chatId);
-      await send(chatId, '✅ Session reset.');
+      await send(chatId, '✅ Context cleared. Ready for a new chat.');
       return;
     }
 
@@ -453,9 +453,9 @@ async function handleCallback(callbackQuery, config, sessionManager, send, answe
     await send(chatId, '✅ Verbose command events disabled.');
     return;
   }
-  if (data === 'reset') {
+  if (data === 'reset' || data === 'new' || data === 'clear') {
     sessionManager.reset(chatId);
-    await send(chatId, '✅ Session reset.');
+    await send(chatId, '✅ Context cleared. Ready for a new chat.');
     return;
   }
   await send(chatId, 'Unknown button action. Use /help.');
@@ -492,7 +492,7 @@ function helpText(config) {
     '/apk - build and send Flutter APK via Telegram',
     '/commit <message> - request git commit after confirmation',
     '/verbose on|off - show/hide Codex shell events',
-    '/reset-task - clear current session state',
+    '/reset-task, /new, /clear - clear context and start a new chat',
     '/continue - continue previous prompt',
     '/queue - show queued task count',
     '/cancel-queue - clear queued tasks',

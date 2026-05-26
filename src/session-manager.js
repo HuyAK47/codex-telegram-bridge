@@ -408,7 +408,17 @@ class SessionManager {
     const session = this.ensure(chatId);
     if (session.running) {
       session.running.kill('SIGTERM');
+      session.running = null;
     }
+    session.codexThreadId = '';
+    session.lastAssistantText = '';
+    session.lastPrompt = '';
+    session.queue = [];
+    session.pendingPlanPrompt = '';
+    session.pendingPlanText = '';
+    session.pendingImagePaths = [];
+    session.autoLoopAttempts = 0;
+    this.persist(chatId, session);
     this.sessions.delete(String(chatId));
     this.audit.write({ type: 'session.reset', chatId });
   }
