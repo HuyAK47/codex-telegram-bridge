@@ -115,7 +115,7 @@ class TelegramClient {
         + `${caption}\r\n`
         + `--${boundary}\r\n`
         + `Content-Disposition: form-data; name="document"; filename="${fileName}"\r\n`
-        + 'Content-Type: application/octet-stream\r\n\r\n`
+        + 'Content-Type: application/octet-stream\r\n\r\n'
       );
       const footer = Buffer.from(`\r\n--${boundary}--\r\n`);
       const stat = fs.statSync(filePath);
