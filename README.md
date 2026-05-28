@@ -18,7 +18,7 @@ Codex Telegram Bridge là bot Telegram bảo mật theo hướng allowlist, giú
 
 - Node.js `>=12`.
 - `npm` để chạy script trong `package.json`.
-- Codex CLI đã cài và đăng nhập trên máy chạy bot (`CODEX_BIN` mặc định là `codex`).
+- Codex CLI (**Chú ý:** Cài bằng npm trên ubuntu ````npm i -g @openai/codex````) đã cài và đăng nhập trên máy chạy bot (`CODEX_BIN` mặc định là `codex`).
 - Telegram bot token từ `@BotFather`.
 - Một hoặc nhiều repo nằm trong thư mục được khai báo ở `WORKSPACE_ALLOWLIST`.
 
