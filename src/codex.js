@@ -16,9 +16,7 @@ function buildCodexArgs(options) {
   const settings = options || {};
   const args = settings.resumeSessionId
     ? ['exec', 'resume', '--json', settings.resumeSessionId]
-    : settings.resumeLast
-      ? ['exec', 'resume', '--last', '--json']
-      : ['exec', '--json', '--color', 'never', '--sandbox', settings.sandboxMode, '--cd', settings.workspace];
+    : ['exec', '--json', '--color', 'never', '--sandbox', settings.sandboxMode, '--cd', settings.workspace];
 
   if (settings.skipGitRepoCheck) {
     args.push('--skip-git-repo-check');

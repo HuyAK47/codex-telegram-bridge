@@ -35,6 +35,7 @@ function buildBotCommands() {
     { command: 'verbose', description: 'Show/hide Codex shell commands: /verbose <on|off>' },
     { command: 'cleanup', description: 'Remove old attachments' },
     { command: 'reset_task', description: 'Clear current session state' },
+    { command: 'new', description: 'Alias for /reset_task' },
     { command: 'continue', description: 'Continue previous prompt' },
     { command: 'run', description: 'Run a profile command: /run <name>' },
     { command: 'ask', description: 'Run Codex once: /ask <prompt>' }
